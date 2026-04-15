@@ -1,98 +1,47 @@
-FROM alpine:3.15 AS st-builder
-
-RUN apk add --no-cache make gcc git freetype-dev \
-            fontconfig-dev musl-dev xproto libx11-dev \
-            libxft-dev libxext-dev
+# Stage 1: Build the 'st' terminal
+FROM debian:bullseye-slim AS st-builder
+RUN apt-get update && apt-get install -y make gcc git libx11-dev libxft-dev libxext-dev
 COPY ./st /work
 WORKDIR /work
 RUN make
 
-FROM alpine:3.15 AS xdummy-builder
-
-RUN apk add --no-cache make gcc freetype-dev \
-            fontconfig-dev musl-dev xproto libx11-dev \
-            libxft-dev libxext-dev avahi-libs libcrypto3 libssl3 libvncserver libx11 libxdamage libxext libxfixes libxi libxinerama libxrandr libxtst musl
-RUN apk add --no-cache linux-headers
-RUN apk add x11vnc 
-RUN Xdummy -install
-
-# ----------------------------------------------------------------------------
-
-FROM pyzmq:dev
+# Stage 2: Final Image
+FROM python:3.11-slim-bullseye
 
 USER root
 ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
-ENV DISPLAY :0
-ENV USER=root
-ENV PASSWORD=root
+ENV DISPLAY=:0
+ENV DEBIAN_FRONTEND=noninteractive
 
+# Install Wine, X11, noVNC, and Fluxbox (lighter than Openbox for Railway)
+RUN apt-get update && apt-get install -y \
+    wine64 wine xvfb x11vnc \
+    novnc websockify fluxbox \
+    wget unzip procps \
+    && rm -rf /var/lib/apt/lists/*
 
-# Basic init and admin tools
-RUN apk --no-cache add supervisor sudo wget \
-    && echo "$USER:$PASSWORD" | /usr/sbin/chpasswd \
-    && rm -rf /apk /tmp/* /var/cache/apk/*
+# Install Python bridge for MT5
+RUN pip install mt5linux
 
-# Install X11 server and dummy device
-RUN apk add --no-cache xorg-server xf86-video-dummy \
-    && apk add libressl3.1-libcrypto --no-cache --repository http://dl-3.alpinelinux.org/alpine/edge/main/ \
-    && apk add libressl3.1-libssl --no-cache --repository http://dl-3.alpinelinux.org/alpine/edge/main/ \
-    && apk add x11vnc --no-cache --repository http://dl-3.alpinelinux.org/alpine/edge/community/ \
-    && rm -rf /apk /tmp/* /var/cache/apk/*
-COPY --from=xdummy-builder /usr/bin/Xdummy.so /usr/bin/Xdummy.so
-COPY assets/xorg.conf /etc/X11/xorg.conf
-COPY assets/xorg.conf.d /etc/X11/xorg.conf.d
+# Setup noVNC
+RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
-# Configure init
-COPY assets/supervisord.conf /etc/supervisord.conf
-
-# Openbox window manager
-RUN apk --no-cache add openbox  \
-    && rm -rf /apk /tmp/* /var/cache/apk/*
-COPY assets/openbox/mayday/mayday-arc /usr/share/themes/mayday-arc
-COPY assets/openbox/mayday/mayday-arc-dark /usr/share/themes/mayday-arc-dark
-COPY assets/openbox/mayday/mayday-grey /usr/share/themes/mayday-grey
-COPY assets/openbox/mayday/mayday-plane /usr/share/themes/mayday-plane
-COPY assets/openbox/mayday/thesis /usr/share/themes/thesis
-COPY assets/openbox/rc.xml /etc/xdg/openbox/rc.xml
-COPY assets/openbox/menu.xml /etc/xdg/openbox/menu.xml
-COPY Metatrader /root/Metatrader
-# Login Manager
-RUN apk --no-cache add slim consolekit \
-    && rm -rf /apk /tmp/* /var/cache/apk/*
-RUN /usr/bin/dbus-uuidgen --ensure=/etc/machine-id
-COPY assets/slim/slim.conf /etc/slim.conf
-COPY assets/slim/alpinelinux /usr/share/slim/themes/alpinelinux
-
-# A decent system font
-RUN apk add --no-cache font-noto \
-    && rm -rf /apk /tmp/* /var/cache/apk/*
-COPY assets/fonts.conf /etc/fonts/fonts.conf
-
-
-
-# st  as terminal
-RUN apk add --no-cache freetype fontconfig xproto libx11 libxft libxext ncurses \
-    && rm -rf /apk /tmp/* /var/cache/apk/*
+# Copy your Terminal and MT5 files
 COPY --from=st-builder /work/st /usr/bin/st
-COPY --from=st-builder /work/st.info /etc/st/st.info
-RUN tic -sx /etc/st/st.info
+COPY Metatrader /root/.wine/drive_c/Program\ Files/MetaTrader\ 5
+COPY bot.py /root/bot.py
 
-# Some other resources
-RUN apk add --no-cache xset \
-    && rm -rf /apk /tmp/* /var/cache/apk/*
-COPY assets/xinit/Xresources /etc/X11/Xresources
-COPY assets/xinit/xinitrc.d /etc/X11/xinit/xinitrc.d
+# Setup Startup Script
+RUN echo '#!/bin/bash\n\
+Xvfb :0 -screen 0 1280x1024x24 &\n\
+fluxbox &\n\
+x11vnc -display :0 -forever -nopw -listen localhost -rfbport 5900 &\n\
+websockify --web /usr/share/novnc/ 8080 localhost:5900 &\n\
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" &\n\
+python3 -m mt5linux &\n\
+python3 /root/bot.py\n\
+wait' > /entrypoint.sh && chmod +x /entrypoint.sh
 
-COPY assets/x11vnc-session.sh /root/x11vnc-session.sh
-COPY assets/start.sh /root/start.sh
-
-
-RUN apk update && apk add samba-winbind wine && ln -s /usr/bin/wine64 /usr/bin/wine
-
-
-WORKDIR /$HOME/
-EXPOSE 5900 15555 15556 15557 15558
-CMD ["/usr/bin/supervisord","-c","/etc/supervisord.conf"]
-
-
+EXPOSE 8080
+CMD ["/entrypoint.sh"]
