@@ -3,10 +3,9 @@
 
 """
 💎 VALETUTAX MT5 BOT – RAILWAY-READY
+- Updated for Valetutax .vx symbols
 - Auto-detects environment (Windows vs Linux)
-- Uses mt5linux bridge on Railway
 - Infinite retry logic for connection
-- Real broker data, no simulation
 """
 
 import time
@@ -17,7 +16,8 @@ from collections import deque
 
 # ============= CONFIGURATION =============
 CONFIG = {
-    "SYMBOLS": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"],
+    # Added .vx suffix as per Valetutax screenshot
+    "SYMBOLS": ["EURUSD.vx", "GBPUSD.vx", "USDJPY.vx", "AUDUSD.vx", "USDCAD.vx"],
     "LOT_SIZE": 0.01,
     "MAX_LOT_SIZE": 0.10,
     "LOOKBACK_TICKS": 50,
@@ -36,7 +36,6 @@ print("=" * 60)
 print("🔍 DETECTING ENVIRONMENT...")
 print("=" * 60)
 
-# Check if we are running on Linux (Railway)
 if os.name != 'nt':
     try:
         from mt5linux import MetaTrader5
@@ -44,7 +43,7 @@ if os.name != 'nt':
         print("✅ Using mt5linux Bridge (Linux/Railway)")
         NATIVE_MODE = False
     except ImportError:
-        print("❌ mt5linux not found! Install it with: pip install mt5linux")
+        print("❌ mt5linux not found!")
         sys.exit(1)
 else:
     try:
@@ -52,18 +51,16 @@ else:
         print("✅ Using Native MetaTrader5 (Windows)")
         NATIVE_MODE = True
     except ImportError:
-        print("❌ MetaTrader5 not found! Install it with: pip install MetaTrader5")
+        print("❌ MetaTrader5 not found!")
         sys.exit(1)
 
-# ============= MT5 BRIDGE WITH RETRY LOGIC =============
+# ============= MT5 CONNECTION RETRY =============
 def get_mt5_connection():
-    """Connect to MT5 with retry logic (critical for Railway)"""
     print("\n" + "=" * 60)
     print("🔌 CONNECTING TO MT5...")
     print("=" * 60)
     
     attempt = 1
-    # On Railway, Wine takes a long time to start. We loop until it works.
     while True:
         try:
             print(f"   [Attempt {attempt}] Connecting to MT5...")
@@ -71,67 +68,61 @@ def get_mt5_connection():
                 print(f"✅ MT5 connected successfully!")
                 return True
             else:
-                print(f"   ⚠️ Initialize failed: {mt5.last_error() if NATIVE_MODE else 'Bridge not ready'}")
+                print(f"   ⚠️ Initialize failed: {mt5.last_error() if NATIVE_MODE else 'Check Wine setup'}")
         except Exception as e:
-            print(f"   ⏳ Waiting for Bridge/Wine... ({e})")
+            print(f"   ⏳ Waiting for Bridge... ({e})")
         
         attempt += 1
-        time.sleep(5) # Wait 5 seconds between retries
+        time.sleep(5)
 
-# Get MT5 connection
 if not get_mt5_connection():
     sys.exit(1)
 
 class RealMT5OFIBot:
     def __init__(self):
-        self.connected = False
         self.tick_buffers = {}
-        self.last_trade_time = {}
         self.daily_trades = 0
-        self.daily_pnl = 0
-        self.daily_start = datetime.now()
         self.initial_balance = 0
         self.running = True
         
     def connect_mt5(self):
-        """Verify MT5 connection and get account info"""
         print("\n" + "=" * 60)
-        print("💰 ACCOUNT INFORMATION")
+        print("💰 ACCOUNT & SYMBOL SETUP")
         print("=" * 60)
         
         try:
             account_info = mt5.account_info()
             if account_info:
                 self.initial_balance = account_info.balance
-                print(f"✅ Account: {account_info.login}")
-                print(f"   Balance: ${account_info.balance:.2f}")
-                print(f"   Server: {account_info.server}")
+                print(f"✅ Account: {account_info.login} | Balance: ${account_info.balance:.2f}")
             else:
                 return False
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Account Error: {e}")
             return False
         
-        # Enable symbols
+        # Enable and verify .vx symbols
         for symbol in CONFIG["SYMBOLS"]:
-            mt5.symbol_select(symbol, True)
-            self.tick_buffers[symbol] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
+            # Ensure the symbol is selected in Market Watch
+            selected = mt5.symbol_select(symbol, True)
+            if selected:
+                print(f"✅ Symbol {symbol} is active")
+                self.tick_buffers[symbol] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
+            else:
+                print(f"⚠️ Warning: Could not find/select {symbol}")
         
-        self.connected = True
         return True
     
     def get_real_ticks(self, symbol):
-        """Get REAL ticks from MT5 broker feed"""
         try:
-            # COPY_TICKS_ALL is 1
+            # COPY_TICKS_ALL = 1
             ticks = mt5.copy_ticks_from(symbol, datetime.now(), CONFIG["LOOKBACK_TICKS"], 1)
             if ticks is None or len(ticks) == 0: return []
             
             result = []
             for tick in ticks:
-                # Handle bridge list format
                 if isinstance(tick, (list, tuple)):
-                    is_buy = bool(tick[2] & 4)
+                    is_buy = bool(tick[2] & 4) # Tick flag for BUY
                     result.append({"symbol": symbol, "price": tick[1], "is_buy": is_buy})
                 else:
                     is_buy = bool(tick.flags & 4)
@@ -141,7 +132,7 @@ class RealMT5OFIBot:
             return []
     
     def calculate_ofi(self, symbol):
-        buffer = self.tick_buffers[symbol]
+        buffer = self.tick_buffers.get(symbol, [])
         if len(buffer) < 10: return None
         buy_ticks = sum(1 for tick in buffer if tick.get("is_buy"))
         sell_ticks = len(buffer) - buy_ticks
@@ -154,31 +145,41 @@ class RealMT5OFIBot:
         tick = mt5.symbol_info_tick(symbol)
         if not tick: return
         
-        order_type = 0 if action == "BUY" else 1
+        order_type = 0 if action == "BUY" else 1 # 0=Buy, 1=Sell
         price = tick.ask if action == "BUY" else tick.bid
         
+        # Calculate TP/SL points
+        point = mt5.symbol_info(symbol).point
+        tp = price + (CONFIG["TAKE_PROFIT_PIPS"] * 10 * point) if action == "BUY" else price - (CONFIG["TAKE_PROFIT_PIPS"] * 10 * point)
+        sl = price - (CONFIG["STOP_LOSS_PIPS"] * 10 * point) if action == "BUY" else price + (CONFIG["STOP_LOSS_PIPS"] * 10 * point)
+
         request = {
-            "action": 1,
+            "action": 1, # TRADE_ACTION_DEAL
             "symbol": symbol,
             "volume": CONFIG["LOT_SIZE"],
             "type": order_type,
             "price": price,
+            "sl": sl,
+            "tp": tp,
             "magic": 2026,
             "comment": f"OFI {ofi_data['ratio']}x",
-            "type_time": 0,
-            "type_filling": 1,
+            "type_time": 0, # GTC
+            "type_filling": 1, # IOC
         }
         
         res = mt5.order_send(request)
         if res and res.retcode == 10009:
             self.daily_trades += 1
-            print(f"✅ {action} {symbol} at {price}")
+            print(f"🔥 {action} EXECUTED: {symbol} @ {price} | OFI: {ofi_data['ratio']}x")
+        else:
+            print(f"❌ Trade failed for {symbol}: {res.comment if res else 'Unknown Error'}")
 
     def run(self):
         if not self.connect_mt5(): return
-        print("\n🚀 BOT RUNNING...")
+        print("\n🚀 VALETUTAX BOT IS LIVE AND TRADING...")
+        
         while self.running:
-            for symbol in CONFIG["SYMBOLS"]:
+            for symbol in self.tick_buffers.keys():
                 ticks = self.get_real_ticks(symbol)
                 for t in ticks: self.tick_buffers[symbol].append(t)
                 
@@ -186,8 +187,10 @@ class RealMT5OFIBot:
                 if ofi:
                     if ofi["ratio"] >= CONFIG["OFI_THRESHOLD"]:
                         self.execute_trade(symbol, "BUY", ofi)
+                        time.sleep(CONFIG["COOLDOWN_SECONDS"])
                     elif ofi["ratio"] <= 1.0 / CONFIG["OFI_THRESHOLD"]:
                         self.execute_trade(symbol, "SELL", ofi)
+                        time.sleep(CONFIG["COOLDOWN_SECONDS"])
             
             time.sleep(CONFIG["SLEEP_INTERVAL"])
 
