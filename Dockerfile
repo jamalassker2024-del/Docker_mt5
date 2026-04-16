@@ -10,7 +10,7 @@ ENV WINEARCH=win64
 ENV DISPLAY=:0
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Install System Tools (No Wine commands here)
+# 1. Install System Tools
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y \
     wine64 wine32 xvfb x11vnc fluxbox \
     novnc websockify wget procps \
@@ -19,14 +19,21 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y \
 # 2. Linux-side Python bridge
 RUN pip install --no-cache-dir mt5linux rpyc
 
-# 3. Just DOWNLOAD the files (Don't run them yet)
+# 3. DOWNLOAD MT5 (Ensuring it is in /root/)
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
-RUN wget -q https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe -O /root/py_setup.exe
 
 COPY --from=st-builder /work/st /usr/bin/st
 COPY bot.py /root/bot.py
 
-# 4. The Runtime Script (Does the heavy lifting AFTER deploy)
+# 4. Create a Menu for Fluxbox so you can always find the Terminal
+RUN mkdir -p /root/.fluxbox && echo '[begin] (Fluxbox)\n\
+[exec] (Terminal) {st}\n\
+[exec] (File Manager) {wine explorer}\n\
+[exec] (Install MT5) {wine /root/mt5setup.exe}\n\
+[restart] (Restart)\n\
+[end]' > /root/.fluxbox/menu
+
+# 5. The Runtime Script
 RUN echo '#!/bin/bash\n\
 Xvfb :0 -screen 0 1280x1024x24 &\n\
 sleep 2\n\
@@ -34,21 +41,19 @@ fluxbox &\n\
 x11vnc -display :0 -forever -shared -nopw -rfbport 5900 &\n\
 websockify --web /usr/share/novnc/ 8080 localhost:5900 &\n\
 \n\
-# Initialize Wine and Install Python for Windows\n\
-echo "Setting up Windows environment..."\n\
+# Initialize Wine\n\
 wine boot --init\n\
-sleep 10\n\
-wine /root/py_setup.exe /quiet PrependPath=1\n\
-sleep 15\n\
-wine python -m pip install MetaTrader5 mt5linux rpyc\n\
+sleep 5\n\
 \n\
-# Start MT5 and the Bridge\n\
+# AUTO-OPEN THE TERMINAL FOR JAMAL\n\
+st -e /bin/bash &\n\
+\n\
+# AUTO-START MT5 INSTALLER\n\
 wine /root/mt5setup.exe &\n\
-sleep 10\n\
-wine python -m mt5linux &\n\
 \n\
-# Run your Bot\n\
-python3 /root/bot.py\n\
+# Run Bot in background (it will wait for bridge)\n\
+python3 /root/bot.py &\n\
+\n\
 wait' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 EXPOSE 8080
