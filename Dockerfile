@@ -23,17 +23,24 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y \
     wget unzip procps git \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install trading bridge
+# 2. Install Python trading bridge (Linux side)
 RUN pip install mt5linux
 
 # 3. Setup web access
 RUN ln -s /usr/share/novnc/vnc.html /usr/share/novnc/index.html
 
-# 4. Copy your files from GitHub into the container
+# 4. Copy your files
 COPY --from=st-builder /work/st /usr/bin/st
 COPY bot.py /root/bot.py
 
-# 5. Startup Script
+# 5. DOWNLOAD & INSTALL PYTHON FOR WINDOWS (Inside Wine)
+# This is required for mt5linux to function
+RUN wget -q https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe -O /root/py_setup.exe \
+    && wine /root/py_setup.exe /quiet PrependPath=1 \
+    && sleep 5 \
+    && wine python -m pip install MetaTrader5 mt5linux
+
+# 6. Startup Script
 RUN echo '#!/bin/bash\n\
 Xvfb :0 -screen 0 1280x1024x24 &\n\
 sleep 2\n\
@@ -46,10 +53,14 @@ if [ ! -f "/root/mt5setup.exe" ]; then\n\
   wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe\n\
 fi\n\
 \n\
+# Start MT5 Terminal\n\
 wine /root/mt5setup.exe &\n\
 \n\
-# Start the Bridge and your Bot\n\
-python3 -m mt5linux &\n\
+# IMPORTANT: Start the Windows-side bridge server\n\
+sleep 10\n\
+wine python -m mt5linux &\n\
+\n\
+# Start your bot\n\
 sleep 5\n\
 python3 /root/bot.py &\n\
 \n\
