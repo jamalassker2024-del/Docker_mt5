@@ -18,13 +18,16 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y \
     && chmod +x /usr/local/bin/winetricks \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Install mt5linux bridge library for the python side
+RUN pip install mt5linux
+
 # 2. Download MT5
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 COPY --from=st-builder /work/st /usr/bin/st
 COPY bot.py /root/bot.py
 
-# 3. Clean Menu (No Explorer at start)
+# 3. Clean Menu
 RUN mkdir -p /root/.fluxbox && echo '[begin] (Fluxbox)\n\
 [exec] (Terminal) {st}\n\
 [exec] (MetaTrader 5) {wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe"}\n\
@@ -32,7 +35,7 @@ RUN mkdir -p /root/.fluxbox && echo '[begin] (Fluxbox)\n\
 [restart] (Restart)\n\
 [end]' > /root/.fluxbox/menu
 
-# 4. Entrypoint with focus on Installer
+# 4. Fixed Entrypoint: Added mt5linux bridge and proper bot execution
 RUN echo '#!/bin/bash\n\
 Xvfb :0 -screen 0 1280x1024x24 &\n\
 sleep 2\n\
@@ -40,18 +43,21 @@ fluxbox &\n\
 x11vnc -display :0 -forever -shared -nopw -rfbport 5900 &\n\
 websockify --web /usr/share/novnc/ 8080 localhost:5900 &\n\
 \n\
-# Init Wine without opening explorer\n\
 wineboot --init\n\
 sleep 5\n\
 \n\
-# Force installer to start\n\
 echo "Starting MT5..."\n\
-wine /root/mt5setup.exe &\n\
+# We use the full path where MT5 usually installs\n\
+wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe" &\n\
 \n\
-# Open terminal so you can see if there are errors\n\
-st -e /bin/bash &\n\
+echo "Starting MT5Linux Bridge..."\n\
+python3 -m mt5linux --port 8001 &\n\
 \n\
-python3 /root/bot.py &\n\
+sleep 15\n\
+\n\
+echo "Starting Bot..."\n\
+# Running the bot in the foreground so logs show up in Railway\n\
+python3 /root/bot.py\n\
 \n\
 wait' > /entrypoint.sh && chmod +x /entrypoint.sh
 
