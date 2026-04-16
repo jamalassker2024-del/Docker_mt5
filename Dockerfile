@@ -1,61 +1,61 @@
-# Stage 1: Build phase
-FROM debian:bookworm-slim AS builder
-USER root
-RUN apt-get update && apt-get install -y wget && \
-    wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /mt5setup.exe
-
-# Stage 2: Final Image
+# Base image
 FROM python:3.11-slim-bookworm
 
-USER root
+ENV DEBIAN_FRONTEND=noninteractive
 ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV DISPLAY=:0
-ENV DEBIAN_FRONTEND=noninteractive
-ENV WINEDEBUG=-all 
+ENV WINEDEBUG=-all
 
-# Install bare minimum (added xterm as it's lighter)
+USER root
+
+# Install dependencies
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
-    wine64 wine32 xvfb x11vnc fluxbox novnc websockify procps xterm \
+    wine64 wine32 winbind xvfb fluxbox x11vnc novnc websockify procps wget cabextract unzip \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Install Python libs
 RUN pip install --no-cache-dir mt5linux rpyc
 
-COPY --from=builder /mt5setup.exe /root/mt5setup.exe
+# Download MT5 during build (NOT runtime)
+RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /mt5setup.exe
+
+# Setup Wine + install MT5 silently
+RUN Xvfb :0 -screen 0 1024x768x16 & \
+    sleep 2 && \
+    wineboot --init && sleep 5 && \
+    wine /mt5setup.exe /silent && sleep 20
+
+# Copy bot
 COPY bot.py /root/bot.py
 
-# Create a manual menu in case the installer is hidden
-RUN mkdir -p /root/.fluxbox && echo '[begin] (Menu)\n\
-[exec] (Installer) {wine /root/mt5setup.exe}\n\
-[exec] (Terminal) {xterm}\n\
-[end]' > /root/.fluxbox/menu
-
+# Entrypoint
 RUN echo '#!/bin/bash\n\
-# 1. Lower resolution and color depth (16-bit saves massive RAM)\n\
+echo "Starting virtual display..."\n\
 Xvfb :0 -screen 0 1024x768x16 &\n\
 sleep 2\n\
 fluxbox &\n\
-sleep 1\n\
 \n\
-# 2. Optimized VNC for slow connections\n\
-x11vnc -display :0 -forever -shared -nopw -rfbport 5900 -ultrafilexfer &\n\
+echo "Starting VNC..."\n\
+x11vnc -display :0 -forever -shared -nopw -rfbport 5900 &\n\
 websockify --web /usr/share/novnc/ 8080 localhost:5900 &\n\
 \n\
-# 3. Quiet Wine Setup\n\
-wineboot --init > /dev/null 2>&1\n\
-sleep 5\n\
+echo "Starting MT5..."\n\
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" &\n\
 \n\
-# 4. Start Installer\n\
-echo "Starting MT5 Setup..."\n\
-wine /root/mt5setup.exe &\n\
+echo "Waiting for MT5..."\n\
+while ! pgrep -f terminal64.exe > /dev/null; do\n\
+    sleep 2\n\
+done\n\
 \n\
-# 5. Start Bridge\n\
+echo "Starting bridge..."\n\
 python3 -m mt5linux --port 8001 &\n\
 \n\
-# 6. Wait for user to finish clicking "Next" in browser\n\
-sleep 45\n\
+echo "Starting bot..."\n\
 python3 /root/bot.py\n\
+\n\
 wait' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 EXPOSE 8080
+
 CMD ["/bin/bash", "/entrypoint.sh"]
