@@ -1,4 +1,4 @@
-# Stage 1: Build/Install phase
+# Stage 1: Build/Install phase (Keep this light)
 FROM debian:bookworm-slim AS builder
 USER root
 RUN apt-get update && apt-get install -y wget && \
@@ -14,14 +14,15 @@ ENV DISPLAY=:0
 ENV DEBIAN_FRONTEND=noninteractive
 ENV WINEDEBUG=-all 
 
-# 1. Essential tools + Python pip setup
+# 1. Essential tools only (no-install-recommends keeps it small)
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine64 wine32 xvfb x11vnc fluxbox novnc websockify procps \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Install mt5linux AND MetaTrader5 (The bridge needs both to "simulate" the library)
+# 2. INSTALL BOTH LIBRARIES (This fixes your "ModuleNotFoundError")
 RUN pip install --no-cache-dir mt5linux MetaTrader5
 
+# Copy installer from builder stage
 COPY --from=builder /mt5setup.exe /root/mt5setup.exe
 COPY bot.py /root/bot.py
 
@@ -33,24 +34,29 @@ fluxbox &\n\
 x11vnc -display :0 -forever -shared -nopw -rfbport 5900 &\n\
 websockify --web /usr/share/novnc/ 8080 localhost:5900 &\n\
 \n\
+# Initialize Wine prefix quietly\n\
 wineboot --init > /dev/null 2>&1\n\
+sleep 5\n\
 \n\
+# Launch MT5\n\
 if [ -f "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" ]; then\n\
     echo "Starting MT5..."\n\
     wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe" &\n\
 else\n\
-    echo "Running Installer..."\n\
+    echo "Running MT5 Installer..."\n\
     wine /root/mt5setup.exe &\n\
 fi\n\
 \n\
-# Start the bridge - added "wine" prefix to the bridge command to help it see MT5\n\
+# Start Bridge (Using -m mt5linux is correct)\n\
 python3 -m mt5linux --port 8001 &\n\
 \n\
-sleep 20\n\
+# Wait for MT5 and Bridge to settle\n\
+sleep 25\n\
 \n\
 echo "Starting Bot..."\n\
-# Force python to see the installed modules\n\
+# Start the actual bot\n\
 python3 /root/bot.py\n\
+\n\
 wait' > /entrypoint.sh && chmod +x /entrypoint.sh
 
 EXPOSE 8080
