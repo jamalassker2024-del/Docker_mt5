@@ -3,9 +3,6 @@
 
 """
 💎 VALETUTAX MT5 BOT – RAILWAY-READY
-- Updated for Valetutax .vx symbols
-- Auto-detects environment (Windows vs Linux)
-- Infinite retry logic for connection
 """
 
 import time
@@ -16,7 +13,6 @@ from collections import deque
 
 # ============= CONFIGURATION =============
 CONFIG = {
-    # Added .vx suffix as per Valetutax screenshot
     "SYMBOLS": ["EURUSD.vx", "GBPUSD.vx", "USDJPY.vx", "AUDUSD.vx", "USDCAD.vx"],
     "LOT_SIZE": 0.01,
     "MAX_LOT_SIZE": 0.10,
@@ -31,7 +27,7 @@ CONFIG = {
     "SLEEP_INTERVAL": 0.2,
 }
 
-# ============= MT5 IMPORT (AUTO-DETECT ENVIRONMENT) =============
+# ============= MT5 IMPORT =============
 print("=" * 60)
 print("🔍 DETECTING ENVIRONMENT...")
 print("=" * 60)
@@ -39,7 +35,8 @@ print("=" * 60)
 if os.name != 'nt':
     try:
         from mt5linux import MetaTrader5
-        mt5 = MetaTrader5(host='localhost', port=8001)
+        # Set host to 127.0.0.1 explicitly to ensure bridge connection
+        mt5 = MetaTrader5(host='127.0.0.1', port=8001)
         print("✅ Using mt5linux Bridge (Linux/Railway)")
         NATIVE_MODE = False
     except ImportError:
@@ -54,7 +51,6 @@ else:
         print("❌ MetaTrader5 not found!")
         sys.exit(1)
 
-# ============= MT5 CONNECTION RETRY =============
 def get_mt5_connection():
     print("\n" + "=" * 60)
     print("🔌 CONNECTING TO MT5...")
@@ -64,15 +60,19 @@ def get_mt5_connection():
     while True:
         try:
             print(f"   [Attempt {attempt}] Connecting to MT5...")
+            # Note: mt5linux bridge needs MT5 terminal to be OPEN first
             if mt5.initialize():
                 print(f"✅ MT5 connected successfully!")
                 return True
             else:
-                print(f"   ⚠️ Initialize failed: {mt5.last_error() if NATIVE_MODE else 'Check Wine setup'}")
+                err = mt5.last_error() if NATIVE_MODE else "Check Bridge/Wine"
+                print(f"   ⚠️ Initialize failed: {err}")
         except Exception as e:
             print(f"   ⏳ Waiting for Bridge... ({e})")
         
         attempt += 1
+        if attempt > 20: # Safety break to see logs
+             print("❌ Failed to connect after many attempts. Check if MT5 is actually running in noVNC.")
         time.sleep(5)
 
 if not get_mt5_connection():
@@ -101,9 +101,7 @@ class RealMT5OFIBot:
             print(f"❌ Account Error: {e}")
             return False
         
-        # Enable and verify .vx symbols
         for symbol in CONFIG["SYMBOLS"]:
-            # Ensure the symbol is selected in Market Watch
             selected = mt5.symbol_select(symbol, True)
             if selected:
                 print(f"✅ Symbol {symbol} is active")
@@ -115,14 +113,14 @@ class RealMT5OFIBot:
     
     def get_real_ticks(self, symbol):
         try:
-            # COPY_TICKS_ALL = 1
             ticks = mt5.copy_ticks_from(symbol, datetime.now(), CONFIG["LOOKBACK_TICKS"], 1)
             if ticks is None or len(ticks) == 0: return []
             
             result = []
             for tick in ticks:
+                # Handling list format often returned by mt5linux
                 if isinstance(tick, (list, tuple)):
-                    is_buy = bool(tick[2] & 4) # Tick flag for BUY
+                    is_buy = bool(tick[2] & 4) 
                     result.append({"symbol": symbol, "price": tick[1], "is_buy": is_buy})
                 else:
                     is_buy = bool(tick.flags & 4)
@@ -145,16 +143,16 @@ class RealMT5OFIBot:
         tick = mt5.symbol_info_tick(symbol)
         if not tick: return
         
-        order_type = 0 if action == "BUY" else 1 # 0=Buy, 1=Sell
+        order_type = 0 if action == "BUY" else 1 
         price = tick.ask if action == "BUY" else tick.bid
         
-        # Calculate TP/SL points
-        point = mt5.symbol_info(symbol).point
+        symbol_info = mt5.symbol_info(symbol)
+        point = symbol_info.point
         tp = price + (CONFIG["TAKE_PROFIT_PIPS"] * 10 * point) if action == "BUY" else price - (CONFIG["TAKE_PROFIT_PIPS"] * 10 * point)
         sl = price - (CONFIG["STOP_LOSS_PIPS"] * 10 * point) if action == "BUY" else price + (CONFIG["STOP_LOSS_PIPS"] * 10 * point)
 
         request = {
-            "action": 1, # TRADE_ACTION_DEAL
+            "action": 1,
             "symbol": symbol,
             "volume": CONFIG["LOT_SIZE"],
             "type": order_type,
@@ -163,8 +161,8 @@ class RealMT5OFIBot:
             "tp": tp,
             "magic": 2026,
             "comment": f"OFI {ofi_data['ratio']}x",
-            "type_time": 0, # GTC
-            "type_filling": 1, # IOC
+            "type_time": 0,
+            "type_filling": 1,
         }
         
         res = mt5.order_send(request)
@@ -172,7 +170,8 @@ class RealMT5OFIBot:
             self.daily_trades += 1
             print(f"🔥 {action} EXECUTED: {symbol} @ {price} | OFI: {ofi_data['ratio']}x")
         else:
-            print(f"❌ Trade failed for {symbol}: {res.comment if res else 'Unknown Error'}")
+            comment = res.comment if res else 'Unknown Error'
+            print(f"❌ Trade failed for {symbol}: {comment}")
 
     def run(self):
         if not self.connect_mt5(): return
