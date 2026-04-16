@@ -3,28 +3,16 @@
 
 """
 💎 VALETUTAX MT5 BOT – LINUX/WINE COMPATIBLE (RAILWAY)
-- Uses mt5linux bridge to connect to MT5 running in Wine
+- Waits for mt5linux bridge to be ready
+- Retry logic for connection
 - Real broker data, no simulation
-- OFI calculation from real ticks
-- Auto-trading on cent account
 """
 
 import time
 import os
+import sys
 from datetime import datetime
 from collections import deque
-import threading
-
-# ============= MT5 BRIDGE FOR LINUX =============
-try:
-    import MetaTrader5 as mt5
-    print("✅ Using native MetaTrader5 (Windows)")
-except ImportError:
-    print("📦 Loading mt5linux bridge for Linux/Wine...")
-    from mt5linux import MetaTrader5
-    # Connect to the MT5 bridge running in Wine
-    mt5 = MetaTrader5(host='localhost', port=8001)
-    print("✅ mt5linux bridge loaded")
 
 # ============= CONFIGURATION =============
 CONFIG = {
@@ -38,9 +26,52 @@ CONFIG = {
     "MAX_SPREAD_PIPS": 3,
     "COOLDOWN_SECONDS": 3,
     "MAX_DAILY_TRADES": 100,
-    "MAX_RISK_PER_TRADE": 2.0,  # percent
-    "SLEEP_INTERVAL": 0.2,  # Seconds between loops (reduced CPU)
+    "MAX_RISK_PER_TRADE": 2.0,
+    "SLEEP_INTERVAL": 0.2,
 }
+
+# ============= MT5 BRIDGE WITH RETRY LOGIC =============
+def get_mt5_connection():
+    """Wait for mt5linux bridge to be ready and connect"""
+    print("📦 Waiting for mt5linux bridge to start...")
+    print("   (This may take 1-2 minutes on first run)")
+    
+    # Try to import mt5linux
+    try:
+        from mt5linux import MetaTrader5
+        print("✅ mt5linux library loaded")
+    except ImportError as e:
+        print(f"❌ Failed to import mt5linux: {e}")
+        return None
+    
+    # Try to connect up to 30 times (every 3 seconds = 90 seconds total)
+    for attempt in range(1, 31):
+        try:
+            print(f"   [Attempt {attempt}/30] Connecting to bridge at localhost:8001...")
+            conn = MetaTrader5(host='localhost', port=8001)
+            
+            if conn.initialize():
+                print(f"✅ mt5linux bridge connected on attempt {attempt}")
+                return conn
+            else:
+                print(f"   Initialize returned False")
+        except ConnectionRefusedError:
+            print(f"   Connection refused - bridge not ready yet")
+        except Exception as e:
+            print(f"   Error: {e}")
+        
+        # Wait before retry
+        time.sleep(3)
+    
+    print("❌ Could not connect to bridge after 30 attempts.")
+    return None
+
+# Get MT5 connection
+mt5 = get_mt5_connection()
+if mt5 is None:
+    print("❌ Failed to connect to MT5 bridge. Shutting down.")
+    print("   Please ensure MT5 is running in noVNC")
+    sys.exit(1)
 
 class RealMT5OFIBot:
     def __init__(self):
@@ -54,51 +85,52 @@ class RealMT5OFIBot:
         self.running = True
         
     def connect_mt5(self):
-        """Connect to MT5 via bridge (Linux/Wine compatible)"""
+        """Connect to MT5 via bridge (already connected, just verify)"""
         print("\n" + "="*60)
-        print("🚀 CONNECTING TO MT5 VIA BRIDGE (RAILWAY/LINUX)")
+        print("🚀 VERIFYING MT5 CONNECTION")
         print("="*60)
         
-        # Initialize connection to MT5
-        if not mt5.initialize():
-            print(f"❌ MT5 initialization failed!")
-            print("   Make sure MT5 is running in noVNC")
-            print(f"   Error: {mt5.last_error() if hasattr(mt5, 'last_error') else 'Unknown'}")
-            return False
-        
         # Get account info
-        account_info = mt5.account_info()
-        if account_info:
-            self.initial_balance = account_info.balance
-            print(f"✅ Connected to MT5")
-            print(f"   Account: {account_info.login}")
-            print(f"   Balance: ${account_info.balance:.2f}")
-            if account_info.balance < 100:
-                print(f"   (Cent account: {account_info.balance:.0f} cents)")
-            print(f"   Leverage: 1:{account_info.leverage}")
-            print(f"   Server: {account_info.server}")
-        else:
-            print("❌ Failed to get account info!")
-            print("   Please ensure you're logged into MT5 in noVNC")
+        try:
+            account_info = mt5.account_info()
+            if account_info:
+                self.initial_balance = account_info.balance
+                print(f"✅ Connected to MT5")
+                print(f"   Account: {account_info.login}")
+                print(f"   Balance: ${account_info.balance:.2f}")
+                if account_info.balance < 100:
+                    print(f"   (Cent account: {account_info.balance:.0f} cents)")
+                print(f"   Leverage: 1:{account_info.leverage}")
+                print(f"   Server: {account_info.server}")
+            else:
+                print("❌ Failed to get account info!")
+                return False
+        except Exception as e:
+            print(f"❌ Error getting account info: {e}")
             return False
         
         # Enable symbols in Market Watch
         for symbol in CONFIG["SYMBOLS"]:
-            info = mt5.symbol_info(symbol)
-            if info:
-                if not info.visible:
-                    mt5.symbol_select(symbol, True)
-                print(f"✅ {symbol} ready (spread: {info.spread/10:.1f} pips)")
-                self.tick_buffers[symbol] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
-            else:
-                print(f"⚠️ {symbol} not found - check symbol name")
-                # Try with .c suffix for cent accounts
-                symbol_c = f"{symbol}.c"
-                info_c = mt5.symbol_info(symbol_c)
-                if info_c:
-                    print(f"   Found {symbol_c} instead!")
-                    CONFIG["SYMBOLS"][CONFIG["SYMBOLS"].index(symbol)] = symbol_c
-                    self.tick_buffers[symbol_c] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
+            try:
+                info = mt5.symbol_info(symbol)
+                if info:
+                    if not info.visible:
+                        mt5.symbol_select(symbol, True)
+                    print(f"✅ {symbol} ready (spread: {info.spread/10:.1f} pips)")
+                    self.tick_buffers[symbol] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
+                else:
+                    print(f"⚠️ {symbol} not found - checking with .c suffix...")
+                    symbol_c = f"{symbol}.c"
+                    info_c = mt5.symbol_info(symbol_c)
+                    if info_c:
+                        print(f"   Found {symbol_c} instead!")
+                        idx = CONFIG["SYMBOLS"].index(symbol)
+                        CONFIG["SYMBOLS"][idx] = symbol_c
+                        self.tick_buffers[symbol_c] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
+                    else:
+                        print(f"⚠️ {symbol} not available")
+            except Exception as e:
+                print(f"⚠️ Error setting up {symbol}: {e}")
         
         self.connected = True
         return True
@@ -106,29 +138,37 @@ class RealMT5OFIBot:
     def get_real_ticks(self, symbol):
         """Get REAL ticks from MT5 broker feed via bridge"""
         try:
-            # Get ticks from last LOOKBACK_TICKS
             now = datetime.now()
-            ticks = mt5.copy_ticks_from(symbol, now, CONFIG["LOOKBACK_TICKS"], mt5.COPY_TICKS_ALL)
+            ticks = mt5.copy_ticks_from(symbol, now, CONFIG["LOOKBACK_TICKS"], 1)  # COPY_TICKS_ALL
             
             if ticks is None or len(ticks) == 0:
                 return []
             
             result = []
             for tick in ticks:
-                # Parse tick data
-                # flags: 2 = Bid (seller aggressive), 4 = Ask (buyer aggressive)
-                is_buy = bool(tick[2] & 4) if len(tick) > 2 else False
-                result.append({
-                    "symbol": symbol,
-                    "price": tick[1] if len(tick) > 1 else 0,
-                    "is_buy": is_buy,
-                    "volume": tick[5] if len(tick) > 5 else 1,
-                    "timestamp": tick[0] if len(tick) > 0 else time.time()
-                })
+                # Handle different tick data structures
+                if isinstance(tick, (list, tuple)):
+                    is_buy = bool(tick[2] & 4) if len(tick) > 2 else False
+                    result.append({
+                        "symbol": symbol,
+                        "price": tick[1] if len(tick) > 1 else 0,
+                        "is_buy": is_buy,
+                        "volume": tick[5] if len(tick) > 5 else 1,
+                        "timestamp": tick[0] if len(tick) > 0 else time.time()
+                    })
+                elif hasattr(tick, 'flags'):
+                    is_buy = bool(tick.flags & 4)
+                    result.append({
+                        "symbol": symbol,
+                        "price": tick.ask if is_buy else tick.bid,
+                        "is_buy": is_buy,
+                        "volume": tick.volume,
+                        "timestamp": tick.time
+                    })
             
             return result
         except Exception as e:
-            print(f"⚠️ Error getting ticks for {symbol}: {e}")
+            # Silently fail to avoid log spam
             return []
     
     def update_tick_buffer(self, symbol):
@@ -143,7 +183,7 @@ class RealMT5OFIBot:
         if len(buffer) < 10:
             return None
         
-        buy_ticks = sum(1 for tick in buffer if tick["is_buy"])
+        buy_ticks = sum(1 for tick in buffer if tick.get("is_buy", False))
         sell_ticks = len(buffer) - buy_ticks
         
         if sell_ticks == 0:
@@ -193,24 +233,18 @@ class RealMT5OFIBot:
     
     def execute_trade(self, symbol, action, ofi_data):
         """Execute real trade on MT5"""
-        # Check daily limits
         if self.daily_trades >= CONFIG["MAX_DAILY_TRADES"]:
-            print("⚠️ Daily trade limit reached")
             return False
         
-        # Check cooldown
         if symbol in self.last_trade_time:
             if time.time() - self.last_trade_time[symbol] < CONFIG["COOLDOWN_SECONDS"]:
                 return False
         
-        # Check spread
         spread = self.get_spread_pips(symbol)
         if spread > CONFIG["MAX_SPREAD_PIPS"]:
-            print(f"⚠️ Spread too high: {spread} pips")
             return False
         
         try:
-            # Get price
             tick = mt5.symbol_info_tick(symbol)
             if not tick:
                 return False
@@ -222,16 +256,15 @@ class RealMT5OFIBot:
                 price = tick.ask
                 tp = price + CONFIG["TAKE_PROFIT_PIPS"] * point * 10
                 sl = price - CONFIG["STOP_LOSS_PIPS"] * point * 10
-                order_type = 0  # ORDER_TYPE_BUY
+                order_type = 0
             else:
                 price = tick.bid
                 tp = price - CONFIG["TAKE_PROFIT_PIPS"] * point * 10
                 sl = price + CONFIG["STOP_LOSS_PIPS"] * point * 10
-                order_type = 1  # ORDER_TYPE_SELL
+                order_type = 1
             
-            # Prepare order request
             request = {
-                "action": 1,  # TRADE_ACTION_DEAL
+                "action": 1,
                 "symbol": symbol,
                 "volume": lot_size,
                 "type": order_type,
@@ -241,30 +274,20 @@ class RealMT5OFIBot:
                 "deviation": 10,
                 "magic": 2026,
                 "comment": f"OFI_{ofi_data['ratio']}x",
-                "type_time": 0,  # ORDER_TIME_GTC
-                "type_filling": 1,  # ORDER_FILLING_IOC
+                "type_time": 0,
+                "type_filling": 1,
             }
             
-            # Send order
             result = mt5.order_send(request)
             
-            if result and result.retcode == 10009:  # TRADE_RETCODE_DONE
+            if result and hasattr(result, 'retcode') and result.retcode == 10009:
                 self.daily_trades += 1
                 self.last_trade_time[symbol] = time.time()
-                
-                print(f"\n{'='*60}")
-                print(f"✅✅✅ {action} ORDER EXECUTED! ✅✅✅")
-                print(f"   Symbol: {symbol}")
-                print(f"   OFI Ratio: {ofi_data['ratio']}x (B:{ofi_data['buy_ticks']} S:{ofi_data['sell_ticks']})")
-                print(f"   Lot: {lot_size:.2f} | Entry: {price:.5f}")
-                print(f"   TP: {tp:.5f} | SL: {sl:.5f}")
-                print(f"{'='*60}\n")
+                print(f"\n✅ {action} {symbol} | OFI: {ofi_data['ratio']}x | Entry: {price:.5f}")
                 return True
             else:
-                print(f"❌ Order failed: {result.comment if result else 'Unknown'}")
                 return False
         except Exception as e:
-            print(f"❌ Trade execution error: {e}")
             return False
     
     def monitor_positions(self):
@@ -274,7 +297,7 @@ class RealMT5OFIBot:
             if positions:
                 total_profit = sum(pos.profit for pos in positions)
                 if abs(total_profit) > 0.01:
-                    print(f"📈 Open positions: {len(positions)} | P&L: ${total_profit:.2f}")
+                    print(f"📈 Positions: {len(positions)} | P&L: ${total_profit:.2f}")
         except:
             pass
     
@@ -284,27 +307,22 @@ class RealMT5OFIBot:
             account_info = mt5.account_info()
             if account_info:
                 roi = (account_info.equity - self.initial_balance) / self.initial_balance * 100 if self.initial_balance > 0 else 0
-                print(f"\n📊 STATUS | Balance: ${account_info.equity:.2f} | ROI: {roi:.2f}% | Trades: {self.daily_trades}")
+                print(f"\n📊 Balance: ${account_info.equity:.2f} | ROI: {roi:.2f}% | Trades: {self.daily_trades}")
         except:
             pass
     
     def run(self):
         """Main bot loop"""
         if not self.connect_mt5():
-            print("\n❌ Failed to connect to MT5. Please ensure:")
-            print("   1. MT5 is running in noVNC")
-            print("   2. You're logged into your account")
-            print("   3. The mt5linux bridge is running (port 8001)")
+            print("\n❌ Failed to verify MT5 connection")
             return
         
         print("\n" + "="*60)
-        print("💎 REAL MT5 OFI BOT – RUNNING ON RAILWAY/LINUX")
+        print("💎 MT5 OFI BOT – RUNNING")
         print("="*60)
         print(f"   Symbols: {', '.join(CONFIG['SYMBOLS'])}")
         print(f"   OFI Threshold: {CONFIG['OFI_THRESHOLD']}x")
-        print(f"   Lot size: {CONFIG['LOT_SIZE']} (dynamic up to {CONFIG['MAX_LOT_SIZE']})")
         print(f"   TP: {CONFIG['TAKE_PROFIT_PIPS']} pips | SL: {CONFIG['STOP_LOSS_PIPS']} pips")
-        print(f"   Sleep interval: {CONFIG['SLEEP_INTERVAL']}s")
         print("="*60 + "\n")
         
         last_status = time.time()
@@ -312,27 +330,19 @@ class RealMT5OFIBot:
         try:
             while self.running:
                 for symbol in CONFIG["SYMBOLS"]:
-                    # Update tick buffer with REAL data
                     self.update_tick_buffer(symbol)
-                    
-                    # Calculate OFI
                     ofi = self.calculate_ofi(symbol)
                     
                     if ofi:
-                        # Check for BUY signal
                         if ofi["ratio"] >= CONFIG["OFI_THRESHOLD"]:
-                            print(f"🚀 {symbol} BUY SIGNAL! Ratio: {ofi['ratio']}x (B:{ofi['buy_ticks']} S:{ofi['sell_ticks']})")
+                            print(f"🚀 {symbol} BUY! {ofi['ratio']}x")
                             self.execute_trade(symbol, "BUY", ofi)
-                        
-                        # Check for SELL signal
                         elif ofi["ratio"] <= 1.0 / CONFIG["OFI_THRESHOLD"]:
-                            print(f"📉 {symbol} SELL SIGNAL! Ratio: {ofi['ratio']}x (B:{ofi['buy_ticks']} S:{ofi['sell_ticks']})")
+                            print(f"📉 {symbol} SELL! {ofi['ratio']}x")
                             self.execute_trade(symbol, "SELL", ofi)
                 
-                # Monitor positions
                 self.monitor_positions()
                 
-                # Status every 30 seconds
                 if time.time() - last_status > 30:
                     self.print_status()
                     last_status = time.time()
