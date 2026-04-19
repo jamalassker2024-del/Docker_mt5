@@ -28,32 +28,31 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. ULTRA AGGRESSIVE PROFIT MAXIMIZER - LOOSENED RULES
+# 4. FIXED EA - AUTO FILLING MODE DETECTION
 # ============================================
 RUN cat << 'EOF' > /root/VALETAX_PROFIT_BOT.mq5
 //+------------------------------------------------------------------+
 //|                                    VALETAX_PROFIT_MAXIMIZER.mq5 |
-//|                          ULTRA AGGRESSIVE - ALL RULES LOOSENED  |
+//|                    FIXED: Auto filling mode detection - V8.0    |
 //+------------------------------------------------------------------+
 #property strict
-#property version "7.0"
+#property version "8.0"
 
 // ============================================
-// LOOSENED AGGRESSIVE SETTINGS
+// AGGRESSIVE PROFIT SETTINGS
 // ============================================
-input double   LotSize = 0.02;              // 🔥 Bigger size for more profit
-input double   OFI_Threshold = 1.15;        // 🔥 LOWERED: More signals (was 1.3)
-input int      Lookback_Bars = 10;          // 🔥 FASTER: Shorter lookback (was 15)
-input int      TakeProfit_Points = 1500;    // 🔥 15 pips on crypto
-input int      StopLoss_Points = 600;       // 🔥 TIGHTER SL: Better R:R (was 800)
-input double   MaxSpread_Points = 800;      // 🔥 LOOSENED: Allow up to 8 pip spread (was 500)
-input int      Cooldown_Seconds = 0;        // 🔥 ZERO cooldown
-input int      MaxDaily_Trades = 2000;      // 🔥 UNLIMITED essentially
-input bool     TradeOnWeekend = true;       // 🔥 Crypto trades 24/7
-input bool     ReverseSignals = false;      // 🔥 Option to flip if needed
-input int      MagicNumber = 777000;
+input double   LotSize = 0.02;
+input double   OFI_Threshold = 1.15;
+input int      Lookback_Bars = 10;
+input int      TakeProfit_Points = 1500;
+input int      StopLoss_Points = 600;
+input double   MaxSpread_Points = 800;
+input int      Cooldown_Seconds = 0;
+input int      MaxDaily_Trades = 2000;
+input bool     TradeOnWeekend = true;
+input int      MagicNumber = 888000;
 
-// Supported symbols array
+// Supported symbols
 string Symbols[] = {
    "BTCUSD.vx",
    "ETHUSD.vx", 
@@ -73,7 +72,44 @@ double initialBalance = 0;
 double maxDrawdown = 0;
 double peakBalance = 0;
 bool isInitialized = false;
-int currentSymbolIndex = 0;
+string lastError = "";
+
+// Cache filling mode per symbol to avoid repeated calls
+int cachedFillingMode[7];
+bool cacheInitialized[7];
+
+//+------------------------------------------------------------------+
+//| Get supported filling mode for symbol (auto-detect)              |
+//+------------------------------------------------------------------+
+int GetSupportedFillingMode(string sym) {
+   long fillingMode = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   
+   // Check supported modes in order of preference
+   if((fillingMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) {
+      return ORDER_FILLING_IOC;
+   }
+   else if((fillingMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) {
+      return ORDER_FILLING_FOK;
+   }
+   else if((fillingMode & SYMBOL_FILLING_RETURN) == SYMBOL_FILLING_RETURN) {
+      return ORDER_FILLING_RETURN;
+   }
+   
+   // Default fallback
+   return ORDER_FILLING_RETURN;
+}
+
+//+------------------------------------------------------------------+
+//| Get filling mode name for logging                                |
+//+------------------------------------------------------------------+
+string GetFillingModeName(int mode) {
+   switch(mode) {
+      case ORDER_FILLING_FOK: return "FOK";
+      case ORDER_FILLING_IOC: return "IOC";
+      case ORDER_FILLING_RETURN: return "RETURN";
+      default: return "UNKNOWN";
+   }
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -84,28 +120,40 @@ int OnInit() {
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    lastTradeDay = dt.day_of_year;
-   isInitialized = true;
    
+   // Initialize cache
+   for(int i = 0; i < ArraySize(Symbols); i++) {
+      cacheInitialized[i] = false;
+   }
+   
+   isInitialized = true;
    EventSetTimer(1);
    
    Print("╔══════════════════════════════════════════════════╗");
-   Print("║     🔥 VALETAX PROFIT MAXIMIZER v7.0 🔥          ║");
+   Print("║     🔥 VALETAX PROFIT MAXIMIZER v8.0 🔥          ║");
+   Print("║        FIXED: Auto Filling Mode Detection        ║");
    Print("╠══════════════════════════════════════════════════╣");
-   Print("║  OFI Threshold: ", OFI_Threshold, "x (LOOSENED)            ║");
-   Print("║  Lookback: ", Lookback_Bars, " bars (FASTER)                 ║");
-   Print("║  TP: ", TakeProfit_Points, " pts | SL: ", StopLoss_Points, " pts      ║");
-   Print("║  Max Spread: ", MaxSpread_Points, " pts (LOOSENED)          ║");
-   Print("║  Cooldown: ", Cooldown_Seconds, "s (DISABLED)                 ║");
-   Print("║  Lot Size: ", LotSize, " (AGGRESSIVE)                    ║");
+   Print("║  OFI Threshold: ", OFI_Threshold, "x                       ║");
+   Print("║  TP: ", TakeProfit_Points, " pts | SL: ", StopLoss_Points, " pts               ║");
+   Print("║  Max Spread: ", MaxSpread_Points, " pts                      ║");
+   Print("║  Lot Size: ", LotSize, "                                ║");
    Print("╠══════════════════════════════════════════════════╣");
-   Print("║  Monitoring: BTC, ETH, DOGE, LTC, XRP, BCH      ║");
+   
+   // Detect and show filling mode for each symbol
+   for(int i = 0; i < ArraySize(Symbols); i++) {
+      int mode = GetSupportedFillingMode(Symbols[i]);
+      cachedFillingMode[i] = mode;
+      cacheInitialized[i] = true;
+      Print("║  ", Symbols[i], ": ", GetFillingModeName(mode), " mode");
+   }
+   
    Print("╚══════════════════════════════════════════════════╝");
    
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Check if position exists for symbol                              |
+//| Check if position exists                                        |
 //+------------------------------------------------------------------+
 bool HasPosition(string sym) {
    int total = PositionsTotal();
@@ -121,7 +169,7 @@ bool HasPosition(string sym) {
 }
 
 //+------------------------------------------------------------------+
-//| Count total open positions                                       |
+//| Count open positions                                            |
 //+------------------------------------------------------------------+
 int CountOpenPositions() {
    int count = 0;
@@ -130,7 +178,6 @@ int CountOpenPositions() {
       ulong ticket = PositionGetTicket(i);
       if(ticket > 0 && PositionSelectByTicket(ticket)) {
          string sym = PositionGetString(POSITION_SYMBOL);
-         // Check if it's one of our crypto symbols
          for(int j = 0; j < ArraySize(Symbols); j++) {
             if(sym == Symbols[j]) {
                count++;
@@ -143,7 +190,7 @@ int CountOpenPositions() {
 }
 
 //+------------------------------------------------------------------+
-//| Get current day of year                                          |
+//| Get day of year                                                 |
 //+------------------------------------------------------------------+
 int GetDayOfYear() {
    MqlDateTime dt;
@@ -152,7 +199,7 @@ int GetDayOfYear() {
 }
 
 //+------------------------------------------------------------------+
-//| Check if weekend (crypto trades anyway)                          |
+//| Weekend check                                                   |
 //+------------------------------------------------------------------+
 bool IsWeekend() {
    MqlDateTime dt;
@@ -161,7 +208,7 @@ bool IsWeekend() {
 }
 
 //+------------------------------------------------------------------+
-//| Calculate OFI for specific symbol                                |
+//| Calculate OFI                                                   |
 //+------------------------------------------------------------------+
 double CalculateOFI(string sym) {
    MqlRates r[];
@@ -182,7 +229,6 @@ double CalculateOFI(string sym) {
       } else if(r[i].close < r[i].open) {
          sellVol += volume;
       } else {
-         // Doji - check tick direction
          if(i > 0 && r[i].close >= r[i-1].close) {
             buyVol += volume * 0.7;
             sellVol += volume * 0.3;
@@ -198,14 +244,24 @@ double CalculateOFI(string sym) {
 }
 
 //+------------------------------------------------------------------+
-//| Get raw spread for symbol                                        |
+//| Get spread                                                      |
 //+------------------------------------------------------------------+
 long GetSpread(string sym) {
    return SymbolInfoInteger(sym, SYMBOL_SPREAD);
 }
 
 //+------------------------------------------------------------------+
-//| Execute trade - AGGRESSIVE VERSION                               |
+//| Find symbol index                                               |
+//+------------------------------------------------------------------+
+int FindSymbolIndex(string sym) {
+   for(int i = 0; i < ArraySize(Symbols); i++) {
+      if(Symbols[i] == sym) return i;
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Execute trade - FIXED with auto filling mode                    |
 //+------------------------------------------------------------------+
 void ExecuteTrade(string sym, bool isBuy, double ofi) {
    MqlTick t;
@@ -220,9 +276,14 @@ void ExecuteTrade(string sym, bool isBuy, double ofi) {
    double sl = isBuy ? price - StopLoss_Points * point : price + StopLoss_Points * point;
    double tp = isBuy ? price + TakeProfit_Points * point : price - TakeProfit_Points * point;
    
-   // 🔥 AGGRESSIVE: If reverse signals enabled, flip direction
-   if(ReverseSignals) {
-      isBuy = !isBuy;
+   // 🔥 FIXED: Get supported filling mode for this symbol
+   int symIndex = FindSymbolIndex(sym);
+   int fillingMode = ORDER_FILLING_RETURN; // Default safe fallback
+   
+   if(symIndex >= 0 && cacheInitialized[symIndex]) {
+      fillingMode = cachedFillingMode[symIndex];
+   } else {
+      fillingMode = GetSupportedFillingMode(sym);
    }
    
    MqlTradeRequest req = {};
@@ -235,9 +296,9 @@ void ExecuteTrade(string sym, bool isBuy, double ofi) {
    req.price = price;
    req.sl = NormalizeDouble(sl, digits);
    req.tp = NormalizeDouble(tp, digits);
-   req.deviation = 150;  // 🔥 MAX SLIPPAGE ALLOWED
+   req.deviation = 150;
    req.magic = MagicNumber;
-   req.type_filling = ORDER_FILLING_IOC;
+   req.type_filling = fillingMode;  // 🔥 FIXED: Auto-detected mode
    req.type_time = ORDER_TIME_GTC;
    req.comment = "🔥" + DoubleToString(ofi, 2) + "x";
    
@@ -249,40 +310,43 @@ void ExecuteTrade(string sym, bool isBuy, double ofi) {
          
          Print("╔══════════════════════════════════════════════╗");
          Print("║  🔥 TRADE EXECUTED! ", isBuy ? "BUY" : "SELL", " 🔥                ║");
-         Print("║  Symbol: ", sym);
+         Print("║  Symbol: ", sym, " (", GetFillingModeName(fillingMode), ")");
          Print("║  OFI: ", DoubleToString(ofi, 2), "x | Price: ", price);
-         Print("║  Daily Trades: ", dailyTrades, " | Total: ", totalTrades);
+         Print("║  Daily: ", dailyTrades, " | Total: ", totalTrades);
          Print("╚══════════════════════════════════════════════╝");
-      } else {
-         // Silently ignore - broker rejection is normal
+      } else if(res.retcode == 10022) {
+         // Unsupported filling mode - update cache and retry once
+         lastError = "Unsupported filling mode - updating...";
+         int newMode = GetSupportedFillingMode(sym);
+         if(symIndex >= 0) {
+            cachedFillingMode[symIndex] = newMode;
+         }
+         req.type_filling = newMode;
+         if(OrderSend(req, res) && res.retcode == TRADE_RETCODE_DONE) {
+            totalTrades++;
+            dailyTrades++;
+            lastTradeTime = TimeCurrent();
+            Print("║  ✅ TRADE SUCCESS after mode switch to ", GetFillingModeName(newMode));
+         }
       }
+   } else {
+      lastError = "OrderSend failed: " + IntegerToString(GetLastError());
    }
 }
 
 //+------------------------------------------------------------------+
-//| Process single symbol                                            |
+//| Process single symbol                                           |
 //+------------------------------------------------------------------+
 void ProcessSymbol(string sym) {
-   // Skip if already have position on this symbol
-   if(HasPosition(sym)) {
-      return;
-   }
+   if(HasPosition(sym)) return;
    
-   // Check spread
    long spread = GetSpread(sym);
-   if(spread > (long)MaxSpread_Points) {
-      return;
-   }
+   if(spread > (long)MaxSpread_Points) return;
    
-   // Weekend check (optional)
-   if(!TradeOnWeekend && IsWeekend()) {
-      return;
-   }
+   if(!TradeOnWeekend && IsWeekend()) return;
    
-   // Calculate OFI
    double ofi = CalculateOFI(sym);
    
-   // 🔥 AGGRESSIVE ENTRY - Lower threshold
    if(ofi >= OFI_Threshold) {
       ExecuteTrade(sym, true, ofi);
    } else if(ofi <= 1.0 / OFI_Threshold) {
@@ -291,53 +355,38 @@ void ProcessSymbol(string sym) {
 }
 
 //+------------------------------------------------------------------+
-//| Main processing - Scan ALL symbols                               |
+//| Process all symbols                                             |
 //+------------------------------------------------------------------+
 void ProcessAllSymbols() {
-   // Daily reset
    int currentDay = GetDayOfYear();
    if(currentDay != lastTradeDay) {
       dailyTrades = 0;
       lastTradeDay = currentDay;
-      Print("🔄 New trading day - Daily trades reset");
    }
    
-   // Trade limit check (very high limit)
-   if(dailyTrades >= MaxDaily_Trades) {
-      return;
-   }
+   if(dailyTrades >= MaxDaily_Trades) return;
    
-   // Cooldown check (disabled when 0)
    if(Cooldown_Seconds > 0) {
-      if(TimeCurrent() - lastTradeTime < Cooldown_Seconds) {
-         return;
-      }
+      if(TimeCurrent() - lastTradeTime < Cooldown_Seconds) return;
    }
    
-   // 🔥 SCAN ALL SYMBOLS
    for(int i = 0; i < ArraySize(Symbols); i++) {
       ProcessSymbol(Symbols[i]);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Update balance tracking                                          |
+//| Update metrics                                                  |
 //+------------------------------------------------------------------+
 void UpdateBalanceMetrics() {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   
-   if(balance > peakBalance) {
-      peakBalance = balance;
-   }
-   
+   if(balance > peakBalance) peakBalance = balance;
    double currentDD = (peakBalance - balance) / peakBalance * 100;
-   if(currentDD > maxDrawdown) {
-      maxDrawdown = currentDD;
-   }
+   if(currentDD > maxDrawdown) maxDrawdown = currentDD;
 }
 
 //+------------------------------------------------------------------+
-//| Tick handler                                                     |
+//| Tick handler                                                    |
 //+------------------------------------------------------------------+
 void OnTick() {
    if(!isInitialized) return;
@@ -345,7 +394,7 @@ void OnTick() {
 }
 
 //+------------------------------------------------------------------+
-//| Timer handler                                                    |
+//| Timer handler                                                   |
 //+------------------------------------------------------------------+
 void OnTimer() {
    if(!isInitialized) return;
@@ -353,7 +402,6 @@ void OnTimer() {
    ProcessAllSymbols();
    UpdateBalanceMetrics();
    
-   // Status report every 30 seconds
    static int counter = 0;
    counter++;
    if(counter >= 30) {
@@ -366,32 +414,24 @@ void OnTimer() {
       Print("║           📊 STATUS REPORT                    ║");
       Print("║  Balance: $", DoubleToString(balance, 2));
       Print("║  Profit: $", DoubleToString(profit, 2), " (", DoubleToString(profitPercent, 2), "%)");
-      Print("║  Open Positions: ", openPositions);
-      Print("║  Daily Trades: ", dailyTrades, " | Total: ", totalTrades);
-      Print("║  Max DD: ", DoubleToString(maxDrawdown, 2), "%");
+      Print("║  Open: ", openPositions, " | Daily: ", dailyTrades, " | Total: ", totalTrades);
       
-      // Show current OFI for each symbol
       for(int i = 0; i < ArraySize(Symbols); i++) {
          double ofi = CalculateOFI(Symbols[i]);
-         long spread = GetSpread(Symbols[i]);
          string signal = "⚪";
-         if(ofi >= OFI_Threshold) signal = "🟢 BUY";
-         else if(ofi <= 1.0/OFI_Threshold) signal = "🔴 SELL";
-         
-         Print("║  ", Symbols[i], ": OFI=", DoubleToString(ofi, 2), 
-               "x ", signal, " | Spread=", spread);
+         if(ofi >= OFI_Threshold) signal = "🟢";
+         else if(ofi <= 1.0/OFI_Threshold) signal = "🔴";
+         Print("║  ", Symbols[i], ": OFI=", DoubleToString(ofi, 2), "x ", signal);
       }
       Print("╚══════════════════════════════════════════════╝");
-      
       counter = 0;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Position close monitor                                           |
+//| Position close monitor                                          |
 //+------------------------------------------------------------------+
 void OnTrade() {
-   // Check recently closed positions
    HistorySelect(TimeCurrent() - 60, TimeCurrent());
    int total = HistoryDealsTotal();
    
@@ -402,12 +442,10 @@ void OnTrade() {
             string sym = HistoryDealGetString(ticket, DEAL_SYMBOL);
             double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
             
-            // Check if it's one of our symbols
             for(int j = 0; j < ArraySize(Symbols); j++) {
                if(sym == Symbols[j]) {
-                  string emoji = profit >= 0 ? "🟢" : "🔴";
-                  Print(emoji, " Position Closed: ", sym, 
-                        " | P/L: $", DoubleToString(profit, 2));
+                  Print(profit >= 0 ? "🟢 Closed: " : "🔴 Closed: ", 
+                        sym, " | $", DoubleToString(profit, 2));
                   break;
                }
             }
@@ -417,7 +455,7 @@ void OnTrade() {
 }
 
 //+------------------------------------------------------------------+
-//| Deinitialization                                                 |
+//| Deinitialization                                                |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
    EventKillTimer();
@@ -432,14 +470,13 @@ void OnDeinit(const int reason) {
    Print("║  Initial: $", DoubleToString(initialBalance, 2));
    Print("║  Final:   $", DoubleToString(finalBalance, 2));
    Print("║  Profit:  $", DoubleToString(totalProfit, 2), " (", DoubleToString(profitPercent, 2), "%)");
-   Print("║  Total Trades: ", totalTrades);
-   Print("║  Max Drawdown: ", DoubleToString(maxDrawdown, 2), "%");
+   Print("║  Trades:  ", totalTrades);
    Print("╚══════════════════════════════════════════════╝");
 }
 EOF
 
 # ============================================
-# 5. FAST ENTRYPOINT
+# 5. ENTRYPOINT
 # ============================================
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
@@ -482,27 +519,21 @@ echo "🔧 Compiling..."
 EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5" /log:"/root/compile.log" 2>&1
 
-if [ -f "/root/compile.log" ]; then
-    if grep -q "0 error(s)" /root/compile.log; then
-        echo "✅ Compilation SUCCESS"
-    else
-        echo "⚠️ Compilation output:"
-        cat /root/compile.log
-    fi
+if [ -f "/root/compile.log" ] && grep -q "0 error(s)" /root/compile.log; then
+    echo "✅ Compilation SUCCESS"
 fi
 
 echo "🌉 Starting MT5-Linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
-echo "💓 Starting 3-second stimulation (ULTRA FAST)..."
+echo "💓 Starting 3-second stimulation..."
 while true; do
     xdotool search --name "MetaTrader" key F5 2>/dev/null || true
-    sleep 3  # 🔥 FASTER: 3-second refresh
+    sleep 3
 done &
 
 echo "╔══════════════════════════════════════════════╗"
-echo "║   🔥 VALETAX PROFIT MAXIMIZER RUNNING 🔥      ║"
-echo "║   Monitoring: BTC, ETH, DOGE, LTC, XRP, BCH  ║"
+echo "║   🔥 FIXED: Auto Filling Mode Detection 🔥    ║"
 echo "║   VNC: http://localhost:8080                 ║"
 echo "╚══════════════════════════════════════════════╝"
 
