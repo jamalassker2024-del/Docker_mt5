@@ -10,29 +10,31 @@ from collections import deque
 # ================= CONFIG =================
 CONFIG = {
     "SYMBOLS": [
-        # Forex
-        "EURUSD.vx", "GBPUSD.vx", "USDJPY.vx", "AUDUSD.vx", "USDCAD.vx",
-        
-        # Crypto (from your screenshot)
+        "EURUSD.vx", "GBPUSD.vx", "USDJPY.vx",
+        "AUDUSD.vx", "USDCAD.vx",
         "BTCUSD.vx", "ETHUSD.vx", "XRPUSD.vx",
-        "LTCUSD.vx", "DOGEUSD.vx", "BCHUSD.vx", "BTCEUR.vx"
+        "LTCUSD.vx", "DOGEUSD.vx"
     ],
-    
-    "LOT_SIZE": 0.01,
-    "LOOKBACK_TICKS": 50,
-    "OFI_THRESHOLD": 1.3,
 
-    # 🔥 Adjusted for crypto
+    "LOT_SIZE": 0.01,
+    "LOOKBACK_TICKS": 30,
+
+    # more realistic for crypto + forex mix
+    "OFI_THRESHOLD": 1.2,
+
     "TAKE_PROFIT_PIPS": 20,
     "STOP_LOSS_PIPS": 15,
-    "MAX_SPREAD_PIPS": 50,   # crypto spreads are bigger
 
-    "COOLDOWN_SECONDS": 5,
+    "MAX_SPREAD_PIPS": 60,
+
+    "COOLDOWN_SECONDS": 3,
     "SLEEP_INTERVAL": 0.5,
 }
 
-# ================= MT5 =================
-print("🔌 Connecting to MT5...")
+# ================= MT5 CONNECT =================
+print("=" * 60)
+print("🔌 CONNECTING TO MT5 BRIDGE")
+print("=" * 60)
 
 if os.name != 'nt':
     from mt5linux import MetaTrader5
@@ -40,37 +42,47 @@ if os.name != 'nt':
 else:
     import MetaTrader5 as mt5
 
-for i in range(20):
+for i in range(30):
     if mt5.initialize():
-        print("✅ Connected")
+        print("✅ MT5 Connected")
         break
-    print(f"⏳ Waiting MT5 {i}")
-    time.sleep(3)
+    print(f"⏳ Waiting MT5... {i}")
+    time.sleep(2)
 else:
-    print("❌ Failed to connect")
+    print("❌ MT5 connection failed")
     sys.exit(1)
 
 # ================= BOT =================
-class Bot:
+class OFIBot:
+
     def __init__(self):
         self.buffers = {}
 
+    # ---------- SYMBOL SETUP ----------
     def setup(self):
-        print("\n🔍 Loading symbols...")
-        all_symbols = [s.name for s in mt5.symbols_get()]
+        print("\n🔍 Loading symbols...\n")
 
-        for s in CONFIG["SYMBOLS"]:
-            if s in all_symbols:
-                mt5.symbol_select(s, True)
-                self.buffers[s] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
-                print(f"✅ {s}")
+        available = [s.name for s in mt5.symbols_get()]
+
+        for sym in CONFIG["SYMBOLS"]:
+            if sym in available:
+                mt5.symbol_select(sym, True)
+                self.buffers[sym] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
+                print(f"✅ Active: {sym}")
             else:
-                print(f"❌ Missing: {s}")
+                print(f"❌ Missing: {sym}")
 
+        if not self.buffers:
+            print("❌ No symbols available → STOP")
+            sys.exit(1)
+
+    # ---------- GET TICKS ----------
     def get_ticks(self, symbol):
         try:
             ticks = mt5.copy_ticks_from(symbol, datetime.now(), 50, 1)
-            if not ticks:
+
+            if ticks is None or len(ticks) == 0:
+                print(f"⚠️ No ticks: {symbol}")
                 return []
 
             parsed = []
@@ -83,11 +95,15 @@ class Bot:
                 parsed.append({"is_buy": is_buy})
 
             return parsed
-        except:
+
+        except Exception as e:
+            print(f"❌ Tick error {symbol}: {e}")
             return []
 
+    # ---------- OFI ----------
     def ofi(self, symbol):
         buf = self.buffers[symbol]
+
         if len(buf) < 10:
             return None
 
@@ -96,31 +112,39 @@ class Bot:
 
         return buys / sells
 
-    def has_pos(self, symbol):
-        p = mt5.positions_get(symbol=symbol)
-        return p and len(p) > 0
+    # ---------- POSITION CHECK ----------
+    def has_position(self, symbol):
+        pos = mt5.positions_get(symbol=symbol)
+        return pos is not None and len(pos) > 0
 
-    def trade(self, symbol, action):
-        if self.has_pos(symbol):
+    # ---------- TRADE EXECUTION ----------
+    def trade(self, symbol, direction):
+
+        if self.has_position(symbol):
+            print(f"⚠️ Already open: {symbol}")
             return
 
         tick = mt5.symbol_info_tick(symbol)
         info = mt5.symbol_info(symbol)
+
         if not tick or not info:
+            print(f"❌ No tick/info: {symbol}")
             return
 
         spread = (tick.ask - tick.bid) / info.point
+        print(f"📏 Spread {symbol}: {spread:.2f}")
+
         if spread > CONFIG["MAX_SPREAD_PIPS"]:
-            print(f"⚠️ Spread high {symbol}: {spread:.1f}")
+            print("⚠️ Spread too high → skip")
             return
 
-        price = tick.ask if action == "BUY" else tick.bid
-        order_type = 0 if action == "BUY" else 1
+        price = tick.ask if direction == "BUY" else tick.bid
+        order_type = 0 if direction == "BUY" else 1
 
-        tp = price + (CONFIG["TAKE_PROFIT_PIPS"] * info.point * 10) if action == "BUY" else price - (CONFIG["TAKE_PROFIT_PIPS"] * info.point * 10)
-        sl = price - (CONFIG["STOP_LOSS_PIPS"] * info.point * 10) if action == "BUY" else price + (CONFIG["STOP_LOSS_PIPS"] * info.point * 10)
+        tp = price + CONFIG["TAKE_PROFIT_PIPS"] * info.point * 10 if direction == "BUY" else price - CONFIG["TAKE_PROFIT_PIPS"] * info.point * 10
+        sl = price - CONFIG["STOP_LOSS_PIPS"] * info.point * 10 if direction == "BUY" else price + CONFIG["STOP_LOSS_PIPS"] * info.point * 10
 
-        req = {
+        request = {
             "action": 1,
             "symbol": symbol,
             "volume": CONFIG["LOT_SIZE"],
@@ -130,45 +154,69 @@ class Bot:
             "tp": tp,
             "deviation": 20,
             "magic": 2026,
-            "comment": "OFI-CRYPTO",
+            "comment": "OFI-BOT",
             "type_time": 0,
             "type_filling": 1,
         }
 
-        res = mt5.order_send(req)
+        res = mt5.order_send(request)
 
-        if res and res.retcode == 10009:
-            print(f"🔥 {action} {symbol}")
+        # ---------- DEBUG RESULT ----------
+        if res:
+            print(f"📩 ORDER: retcode={res.retcode} comment={res.comment}")
+
+            if res.retcode == 10009:
+                print(f"🔥 TRADE OPENED: {direction} {symbol} @ {price}")
+            else:
+                print(f"❌ REJECTED: {symbol}")
         else:
-            print(f"❌ Failed {symbol}: {res}")
+            print("❌ No response from broker")
 
+    # ---------- MAIN LOOP ----------
     def run(self):
+
         self.setup()
 
-        print("\n🚀 BOT LIVE (FOREX + CRYPTO)\n")
+        print("\n🚀 BOT STARTED (FULL DEBUG MODE)\n")
 
         while True:
-            for s in self.buffers:
-                ticks = self.get_ticks(s)
-                for t in ticks:
-                    self.buffers[s].append(t)
 
-                ratio = self.ofi(s)
-                if not ratio:
+            for symbol in self.buffers:
+
+                print(f"\n🔎 Checking: {symbol}")
+
+                ticks = self.get_ticks(symbol)
+
+                print(f"Ticks: {len(ticks)}")
+
+                for t in ticks:
+                    self.buffers[symbol].append(t)
+
+                print(f"Buffer: {len(self.buffers[symbol])}")
+
+                ratio = self.ofi(symbol)
+
+                if ratio is None:
+                    print("⚠️ Not enough data")
                     continue
 
-                print(f"{s} → {ratio:.2f}")
+                print(f"📊 OFI: {ratio:.2f}")
 
                 if ratio >= CONFIG["OFI_THRESHOLD"]:
-                    self.trade(s, "BUY")
-                    time.sleep(CONFIG["COOLDOWN_SECONDS"])
+                    print("🟢 BUY SIGNAL")
+                    self.trade(symbol, "BUY")
 
                 elif ratio <= 1 / CONFIG["OFI_THRESHOLD"]:
-                    self.trade(s, "SELL")
-                    time.sleep(CONFIG["COOLDOWN_SECONDS"])
+                    print("🔴 SELL SIGNAL")
+                    self.trade(symbol, "SELL")
+
+                else:
+                    print("⏸ No trade signal")
 
             time.sleep(CONFIG["SLEEP_INTERVAL"])
 
 
+# ================= START =================
 if __name__ == "__main__":
-    Bot().run()
+    bot = OFIBot()
+    bot.run()
