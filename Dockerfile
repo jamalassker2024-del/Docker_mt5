@@ -1,67 +1,94 @@
-FROM debian:bookworm-slim AS st-builder
-RUN apt-get update && apt-get install -y make gcc git libx11-dev libxft-dev libxext-dev
-RUN git clone https://git.suckless.org/st /work && cd /work && make
-
 FROM python:3.11-slim-bookworm
 
 USER root
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISPLAY=:0
 ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
-ENV DISPLAY=:0
-ENV DEBIAN_FRONTEND=noninteractive
-ENV WINEDEBUG=-all 
+ENV WINEDEBUG=-all
 
-# 1. Install System Tools + Performance dependencies
+# 1. Install system + Wine properly
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
-    wine64 wine32 xvfb x11vnc fluxbox \
-    novnc websockify wget procps \
+    wine64 wine32 winbind xvfb x11vnc fluxbox \
+    novnc websockify wget curl procps cabextract \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Bridge + RPyC
+# 2. Python deps
 RUN pip install --no-cache-dir mt5linux rpyc
 
-# 3. Download MT5
+# 3. Download MT5 installer
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-COPY --from=st-builder /work/st /usr/bin/st
+# 4. Copy bot
 COPY bot.py /root/bot.py
 
-# 4. Correct Fluxbox Menu (Fixed Terminal paths)
-RUN mkdir -p /root/.fluxbox && echo '[begin] (Fluxbox)\n\
-[exec] (Terminal) {st}\n\
-[exec] (Install MT5 Manually) {wine /root/mt5setup.exe}\n\
-[exec] (Run MT5) {wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe"}\n\
-[end]' > /root/.fluxbox/menu
+# 5. Entrypoint
+RUN echo '#!/bin/bash
 
-# 5. The Runtime Script
-RUN echo '#!/bin/bash\n\
-# Initialize display\n\
-Xvfb :0 -screen 0 1024x768x16 &\n\
-sleep 2\n\
-fluxbox &\n\
-x11vnc -display :0 -forever -shared -nopw -rfbport 5900 &\n\
-websockify --web /usr/share/novnc/ 8080 localhost:5900 &\n\
-\n\
-echo "Initializing Wine..."\n\
-wineboot --init\n\
-sleep 10\n\
-\n\
-# CHECK: If MT5 is not there, pop up the installer immediately\n\
-if [ ! -f "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" ]; then\n\
-    echo "MT5 not found. Launching installer window..."\n\
-    wine /root/mt5setup.exe &\n\
-else\n\
-    echo "MT5 found. Starting Terminal..."\n\
-    wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe" &\n\
-fi\n\
-\n\
-# Start Bridge (Wait for Wine to be ready)\n\
-(sleep 30 && python3 -m mt5linux --port 8001) &\n\
-\n\
-# Start Bot (Wait for Bridge)\n\
-(sleep 45 && python3 /root/bot.py) &\n\
-\n\
-wait' > /entrypoint.sh && chmod +x /entrypoint.sh
+set -e
 
-EXPOSE 8080
+echo "Starting virtual display..."
+Xvfb :0 -screen 0 1280x800x16 &
+sleep 2
+
+fluxbox &
+x11vnc -display :0 -forever -shared -nopw -rfbport 5900 &
+websockify --web=/usr/share/novnc/ 8080 localhost:5900 &
+
+echo "Initializing Wine (first run)..."
+wineboot --init
+sleep 5
+
+MT5_PATH_1="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+MT5_PATH_2="/root/.wine/drive_c/Program Files (x86)/MetaTrader 5/terminal64.exe"
+
+start_mt5() {
+    if [ -f "$MT5_PATH_1" ]; then
+        echo "Launching MT5 (64-bit)..."
+        wine "$MT5_PATH_1" &
+        return 0
+    elif [ -f "$MT5_PATH_2" ]; then
+        echo "Launching MT5 (x86)..."
+        wine "$MT5_PATH_2" &
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Install if not found
+if ! start_mt5; then
+    echo "MT5 not found. Launching installer..."
+    wine /root/mt5setup.exe &
+    
+    echo "Waiting for MT5 installation..."
+    for i in {1..120}; do
+        sleep 5
+        if start_mt5; then
+            echo "MT5 installed successfully!"
+            break
+        fi
+        echo "Still waiting for install..."
+    done
+fi
+
+echo "Waiting for MT5 to fully start..."
+sleep 20
+
+echo "Starting MT5 bridge..."
+python3 -m mt5linux --host 0.0.0.0 --port 8001 &
+
+echo "Waiting for bridge..."
+sleep 10
+
+echo "Starting bot..."
+python3 /root/bot.py &
+
+echo "System ready. Access via browser."
+wait
+' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+EXPOSE 8080 8001
+
 CMD ["/bin/bash", "/entrypoint.sh"]
