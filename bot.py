@@ -9,10 +9,10 @@ from collections import deque
 
 # ================= CONFIG =================
 CONFIG = {
-    "BASE_SYMBOLS": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"],
+    "SYMBOLS": ["EURUSD.vx", "GBPUSD.vx", "USDJPY.vx", "AUDUSD.vx", "USDCAD.vx"],
     "LOT_SIZE": 0.01,
     "LOOKBACK_TICKS": 50,
-    "OFI_THRESHOLD": 1.3,   # LOWERED → more trades
+    "OFI_THRESHOLD": 1.3,
     "TAKE_PROFIT_PIPS": 10,
     "STOP_LOSS_PIPS": 8,
     "MAX_SPREAD_PIPS": 3,
@@ -46,26 +46,19 @@ else:
 class OFIBot:
     def __init__(self):
         self.tick_buffers = {}
-        self.symbols = []
 
     def setup_symbols(self):
-        print("\n🔍 Detecting symbols...")
+        print("\n🔍 Checking .vx symbols...")
         all_symbols = mt5.symbols_get()
+        available_names = [s.name for s in all_symbols]
 
-        for base in CONFIG["BASE_SYMBOLS"]:
-            found = None
-            for s in all_symbols:
-                if base in s.name:
-                    found = s.name
-                    break
-
-            if found:
-                mt5.symbol_select(found, True)
-                self.symbols.append(found)
-                self.tick_buffers[found] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
-                print(f"✅ Using: {found}")
+        for symbol in CONFIG["SYMBOLS"]:
+            if symbol in available_names:
+                mt5.symbol_select(symbol, True)
+                self.tick_buffers[symbol] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
+                print(f"✅ Enabled: {symbol}")
             else:
-                print(f"❌ Not found: {base}")
+                print(f"❌ NOT FOUND: {symbol}")
 
     def get_ticks(self, symbol):
         try:
@@ -78,10 +71,11 @@ class OFIBot:
             for t in ticks:
                 if isinstance(t, (list, tuple)):
                     is_buy = bool(t[2] & 4)
-                    parsed.append({"is_buy": is_buy})
                 else:
                     is_buy = bool(t.flags & 4)
-                    parsed.append({"is_buy": is_buy})
+
+                parsed.append({"is_buy": is_buy})
+
             return parsed
 
         except Exception as e:
@@ -95,12 +89,10 @@ class OFIBot:
 
         buys = sum(1 for t in buf if t["is_buy"])
         sells = len(buf) - buys
-
         if sells == 0:
             sells = 1
 
-        ratio = buys / sells
-        return ratio
+        return buys / sells
 
     def has_position(self, symbol):
         pos = mt5.positions_get(symbol=symbol)
@@ -115,6 +107,7 @@ class OFIBot:
         info = mt5.symbol_info(symbol)
 
         if not tick or not info:
+            print(f"❌ No tick/info: {symbol}")
             return
 
         spread = (tick.ask - tick.bid) / info.point
@@ -138,7 +131,7 @@ class OFIBot:
             "tp": tp,
             "deviation": 20,
             "magic": 2026,
-            "comment": "OFI BOT",
+            "comment": "OFI.vx",
             "type_time": 0,
             "type_filling": 1,
         }
@@ -152,7 +145,7 @@ class OFIBot:
 
     def test_trade(self):
         print("\n🧪 TEST TRADE...")
-        for s in self.symbols:
+        for s in self.tick_buffers.keys():
             tick = mt5.symbol_info_tick(s)
             if tick:
                 self.execute_trade(s, "BUY")
@@ -161,16 +154,16 @@ class OFIBot:
     def run(self):
         self.setup_symbols()
 
-        if not self.symbols:
-            print("❌ No symbols available")
+        if not self.tick_buffers:
+            print("❌ No valid .vx symbols → bot stopped")
             return
 
         self.test_trade()
 
-        print("\n🚀 BOT RUNNING...\n")
+        print("\n🚀 BOT RUNNING (.vx)...\n")
 
         while True:
-            for symbol in self.symbols:
+            for symbol in self.tick_buffers.keys():
                 ticks = self.get_ticks(symbol)
 
                 for t in ticks:
