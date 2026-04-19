@@ -1,34 +1,25 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import time
 import sys
 import logging
 from datetime import datetime
 from collections import deque
-import MetaTrader5 as mt5
+from mt5linux import MetaTrader5
 
 # ==============================================================================
-# 1. ADVANCED LOGGING SETUP (Console + File)
+# 1. INDUSTRIAL LOGGING (Forces logs to show in Railway Console)
 # ==============================================================================
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout), # Essential for Railway logs
+        logging.FileHandler('/root/trading_debug.log')
+    ]
+)
 logger = logging.getLogger("OFIBot")
-logger.setLevel(logging.DEBUG)
-
-# Create formatters
-log_format = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-
-# Console Handler (for noVNC terminal)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_format)
-logger.addHandler(console_handler)
-
-# File Handler (to check history later)
-file_handler = logging.FileHandler('trading_debug.log')
-file_handler.setFormatter(log_format)
-logger.addHandler(file_handler)
 
 # ==============================================================================
-# 2. CONFIGURATION (Screenshot Symbols + Top 20)
+# 2. CONFIGURATION (Symbols from your Screenshot)
 # ==============================================================================
 CONFIG = {
     "SYMBOLS": [
@@ -40,61 +31,54 @@ CONFIG = {
     ],
     "LOT_SIZE": 0.01,
     "LOOKBACK_TICKS": 30,
-    "OFI_THRESHOLD": 1.3, # Slightly stricter for production
-    "TAKE_PROFIT_PIPS": 30,
-    "STOP_LOSS_PIPS": 20,
+    "OFI_THRESHOLD": 1.2,
+    "TAKE_PROFIT_PIPS": 20,
+    "STOP_LOSS_PIPS": 15,
     "SLEEP_INTERVAL": 1.0, 
 }
+
+# Initialize mt5linux bridge (connecting to the port opened in entrypoint.sh)
+mt5 = MetaTrader5(host='localhost', port=8001)
 
 class OFIBot:
     def __init__(self):
         self.buffers = {}
 
     def get_error_desc(self, code):
-        """Translates MT5 codes into human language."""
-        errors = {
-            10013: "Invalid Request",
-            10014: "Invalid Volume/Lot Size",
-            10015: "Invalid Price (Check Connectivity)",
-            10016: "Invalid Stops (SL/TP too close to price)",
-            10018: "Market Closed",
-            10019: "Not Enough Money",
-            10027: "Too Frequent Requests"
-        }
-        return errors.get(code, f"Unknown Error ({code})")
+        errors = {10013: "Invalid Request", 10014: "Invalid Volume", 10016: "Invalid Stops", 10018: "Market Closed"}
+        return errors.get(code, f"Code {code}")
 
-    def initialize_mt5(self):
-        logger.info("--- STARTING INITIALIZATION ---")
+    def initialize_connection(self):
+        logger.info("📡 Attempting to connect to mt5linux bridge...")
         if not mt5.initialize():
-            logger.critical(f"MT5 Init Failed! Error: {mt5.last_error()}")
+            logger.error(f"❌ Failed to connect to MT5 bridge: {mt5.last_error()}")
             return False
         
         acc = mt5.account_info()
         if acc:
-            logger.info(f"✅ Connected to Account: {acc.login} on {acc.server}")
-            logger.info(f"💰 Balance: {acc.balance} {acc.currency} | Equity: {acc.equity}")
+            logger.info(f"✅ Connected! Account: {acc.login} | Server: {acc.server}")
+            logger.info(f"💰 Balance: {acc.balance} | Equity: {acc.equity}")
         return True
 
     def setup_symbols(self):
-        logger.info("🔍 Validating symbols from Market Watch...")
+        logger.info("🔍 Selecting symbols from Market Watch...")
         for sym in CONFIG["SYMBOLS"]:
             if mt5.symbol_select(sym, True):
                 self.buffers[sym] = deque(maxlen=CONFIG["LOOKBACK_TICKS"])
-                logger.debug(f"Symbol {sym} is ready.")
+                logger.debug(f"✅ Active: {sym}")
             else:
-                logger.warning(f"Symbol {sym} not found or not supported by broker.")
+                logger.warning(f"⚠️ Symbol {sym} not found on this broker.")
 
         if not self.buffers:
-            logger.error("No valid symbols found. Check your broker's naming convention.")
+            logger.critical("❌ No active symbols. Check Market Watch in noVNC!")
             sys.exit(1)
 
     def trade(self, symbol, direction):
-        # 1. Pre-trade checks
         tick = mt5.symbol_info_tick(symbol)
         info = mt5.symbol_info(symbol)
         
         if not tick or not info:
-            logger.error(f"Failed to get price/info for {symbol}")
+            logger.error(f"❌ No data for {symbol}")
             return
 
         price = tick.ask if direction == "BUY" else tick.bid
@@ -102,7 +86,6 @@ class OFIBot:
         sl = price - (CONFIG["STOP_LOSS_PIPS"] * multiplier) if direction == "BUY" else price + (CONFIG["STOP_LOSS_PIPS"] * multiplier)
         tp = price + (CONFIG["TAKE_PROFIT_PIPS"] * multiplier) if direction == "BUY" else price - (CONFIG["TAKE_PROFIT_PIPS"] * multiplier)
 
-        # 2. Build Request
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -112,66 +95,54 @@ class OFIBot:
             "sl": sl,
             "tp": tp,
             "deviation": 20,
-            "magic": 20260419,
-            "comment": "DeepDebugBot",
+            "magic": 2026,
+            "comment": "OFI Linux Bot",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC, # Most common for crypto
+            "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
-        # 3. Execution & Full Response Logging
-        logger.info(f"🚀 SENDING {direction}: {symbol} at {price} (SL: {sl}, TP: {tp})")
-        
-        start_time = time.time()
+        logger.info(f"📤 SENDING {direction} {symbol} @ {price}")
         result = mt5.order_send(request)
-        end_time = time.time()
-
+        
         if result is None:
-            logger.error(f"❌ SYSTEM ERROR: No response from MT5. Code: {mt5.last_error()}")
-            return
-
-        # LOG THE FULL DICTIONARY RESPONSE
-        res_dict = result._asdict()
-        logger.debug(f"RAW MT5 RESPONSE: {res_dict}")
-
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"🔥 SUCCESS! {symbol} {direction} Opened. Ticket: {result.order}")
+            logger.error(f"❌ MT5 Bridge Error: {mt5.last_error()}")
+        elif result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"❌ REJECTED: {result.retcode} ({self.get_error_desc(result.retcode)})")
+            logger.debug(f"Full Result: {result._asdict()}")
         else:
-            reason = self.get_error_desc(result.retcode)
-            logger.error(f"❌ TRADE REJECTED | Code: {result.retcode} | Reason: {reason}")
-            logger.warning(f"MT5 Comment: {result.comment}")
+            logger.info(f"🔥 SUCCESS: {symbol} {direction} Opened! Ticket: {result.order}")
 
     def run(self):
-        if not self.initialize_mt5(): return
+        if not self.initialize_connection(): return
         self.setup_symbols()
         
-        logger.info("--- BOT RUNNING IN PRODUCTION MODE ---")
+        logger.info("🚀 Monitoring for Order Flow Imbalance...")
         while True:
-            for symbol in list(self.buffers.keys()):
-                ticks = mt5.copy_ticks_from(symbol, datetime.now(), CONFIG["LOOKBACK_TICKS"], mt5.COPY_TICKS_ALL)
-                
-                if ticks is None or len(ticks) < 10:
-                    continue
+            try:
+                for symbol in list(self.buffers.keys()):
+                    # Get tick data from bridge
+                    ticks = mt5.copy_ticks_from(symbol, datetime.now(), CONFIG["LOOKBACK_TICKS"], mt5.COPY_TICKS_ALL)
+                    
+                    if ticks is None or len(ticks) < 10:
+                        continue
 
-                # OFI Calculation
-                buys = sum(1 for t in ticks if t[1] > t[2]) # Ask > Bid
-                sells = len(ticks) - buys
-                ratio = buys / (sells if sells > 0 else 1)
+                    # OFI: Comparing Ask/Bid pressure
+                    buys = sum(1 for t in ticks if t[1] > t[2]) # t[1]=bid, t[2]=ask (order varies by broker)
+                    sells = len(ticks) - buys
+                    ratio = buys / (sells if sells > 0 else 1)
 
-                if ratio >= CONFIG["OFI_THRESHOLD"]:
-                    if not mt5.positions_get(symbol=symbol):
-                        self.trade(symbol, "BUY")
-                elif ratio <= (1 / CONFIG["OFI_THRESHOLD"]):
-                    if not mt5.positions_get(symbol=symbol):
-                        self.trade(symbol, "SELL")
+                    if ratio >= CONFIG["OFI_THRESHOLD"]:
+                        if not mt5.positions_get(symbol=symbol):
+                            self.trade(symbol, "BUY")
+                    elif ratio <= (1 / CONFIG["OFI_THRESHOLD"]):
+                        if not mt5.positions_get(symbol=symbol):
+                            self.trade(symbol, "SELL")
                 
-            time.sleep(CONFIG["SLEEP_INTERVAL"])
+                time.sleep(CONFIG["SLEEP_INTERVAL"])
+            except Exception as e:
+                logger.exception(f"Loop Error: {e}")
+                time.sleep(5)
 
 if __name__ == "__main__":
-    try:
-        bot = OFIBot()
-        bot.run()
-    except Exception as e:
-        logger.exception(f"CRASH DETECTED: {e}")
-    finally:
-        mt5.shutdown()
-        logger.info("--- MT5 SHUTDOWN ---")
+    bot = OFIBot()
+    bot.run()
