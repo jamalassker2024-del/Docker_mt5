@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. Create MQL5 Bot Code (FIXED MQL5 ERRORS)
+# 4. Create MQL5 Bot Code (FIXED 'tick_volume' ERROR)
 # ============================================
 RUN cat << 'EOF' > /root/OFI_Tick_Bot.mq5
 //+------------------------------------------------------------------+
@@ -109,11 +109,13 @@ void OnTick() {
       lastPrice = tickPrice;
    }
    
-   // Fixed explicit struct assignment
+   // FIXED: Struct assignment using the correct MqlTick member
    int idx = tickCount % LookbackTicks;
    tickBuffer[idx].time = TimeCurrent();
    tickBuffer[idx].price = tickPrice;
    tickBuffer[idx].isBuy = isBuyTick;
+   
+   // FIXED: MT5 uses tick_volume for the volume of the current tick
    tickBuffer[idx].volume = currentTick.tick_volume;
    
    tickCount++;
