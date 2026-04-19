@@ -9,94 +9,74 @@ ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
 # ============================================
-# 1. Install Wine + Dependencies
+# 1. FAST + LIGHT WINE ENV (optimized)
 # ============================================
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
-    xvfb x11vnc fluxbox \
-    novnc websockify wget curl procps cabextract \
-    unzip dos2unix xdotool \
+    xvfb fluxbox x11vnc novnc websockify \
+    wget curl procps cabextract unzip dos2unix xdotool \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ============================================
-# 2. Python Dependencies
+# 2. Python (light bridge only)
 # ============================================
 RUN pip install --no-cache-dir mt5linux rpyc
 
 # ============================================
-# 3. Download MT5
+# 3. MT5 installer
 # ============================================
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. COMPILE-SAFE OFI BOT - Guaranteed Trades
+# 4. ULTRA FAST AGGRESSIVE EA (COMPILE-SAFE)
 # ============================================
-RUN cat << 'EOF' > /root/OFI_Alpha_Bot.mq5
+RUN cat << 'EOF' > /root/FAST_OFI_BOT.mq5
 //+------------------------------------------------------------------+
-//|                                                OFI_Alpha_Bot.mq5 |
-//|                          COMPILE-SAFE - Wine Optimized - V3.0    |
+//|                                          FAST_AGGRESSIVE_OFI.mq5 |
+//|                                PRODUCTION v5.0 - COMPILE SAFE    |
 //+------------------------------------------------------------------+
-#property copyright "Alpha OFI"
-#property version   "3.00"
 #property strict
-#property indicator_chart_window  // REMOVE THIS LINE BEFORE COMPILING AS EXPERT
-// NOTE: The above line is commented in final version - it's an EXPERT, not indicator
+#property version "5.0"
 
 input double   LotSize = 0.01;
-input double   OFIThreshold = 1.5;        
-input int      LookbackBars = 20;         
-input int      TakeProfitPips = 15;
-input int      StopLossPips = 10;
-input double   MaxSpreadPips = 5.0;       
-input int      CooldownSeconds = 1;       
-input int      MaxDailyTrades = 500;      
+input double   Threshold = 1.3;        // 🔥 Aggressive entry
+input int      TP = 10;                // Take profit pips
+input int      SL = 8;                 // Stop loss pips
+input double   MaxSpread = 6.0;        // Relaxed spread filter
+input int      Cooldown = 0;           // 🔥 NO cooldown (max speed)
+input int      MaxTrades = 1000;       // 🔥 High frequency ready
 
-// State variables
-datetime lastTradeTime = 0;
-int      dailyTrades = 0;
-int      lastTradeDay = 0;
-double   initialBalance = 0;
-bool     isInTrade = false;
-int      consecutiveLosses = 0;
-double   lastOFIValue = 0;
-datetime lastProcessTime = 0;
+datetime lastTrade = 0;
+int trades = 0;
+int lastTradeDay = 0;
+double initialBalance = 0;
 
 //+------------------------------------------------------------------+
-//| Expert initialization function                                   |
+//| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit() {
-   Print("╔════════════════════════════════════════════╗");
-   Print("║     🚀 OFI ALPHA BOT - COMPILE SAFE v3     ║");
-   Print("║     Threshold: ", OFIThreshold, "x | TP: ", TakeProfitPips, "pips   ║");
-   Print("╚════════════════════════════════════════════╝");
-   
+   EventSetTimer(1);  // Stable 1-second loop
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);  // FIXED: Correct MQL5 syntax
+   TimeToStruct(TimeCurrent(), dt);
    lastTradeDay = dt.day;
    
-   // CRITICAL: Use only EventSetTimer - MillisecondTimer unstable in Wine
-   EventSetTimer(1);  // 1 second interval - Wine stable
+   Print("╔═══════════════════════════════════════════╗");
+   Print("║   🚀 FAST AGGRESSIVE OFI BOT v5.0         ║");
+   Print("║   Threshold: ", Threshold, "x | TP: ", TP, " | SL: ", SL, "      ║");
+   Print("║   Max Trades: ", MaxTrades, " | Cooldown: 0s        ║");
+   Print("╚═══════════════════════════════════════════╝");
    
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Get current day - Safe method                                    |
+//| Check for open position                                          |
 //+------------------------------------------------------------------+
-int GetCurrentDay() {
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);  // FIXED: Correct syntax
-   return dt.day;
-}
-
-//+------------------------------------------------------------------+
-//| Check if we have open position - Safe loop                       |
-//+------------------------------------------------------------------+
-bool HasOpenPosition() {
+bool HasPos() {
    int total = PositionsTotal();
-   for(int i = total - 1; i >= 0; i--) {
-      ulong ticket = PositionGetTicket(i);  // FIXED: Safe ticket retrieval
+   for(int i = 0; i < total; i++) {
+      ulong ticket = PositionGetTicket(i);
       if(ticket > 0 && PositionSelectByTicket(ticket)) {
          if(PositionGetString(POSITION_SYMBOL) == _Symbol) {
             return true;
@@ -107,138 +87,71 @@ bool HasOpenPosition() {
 }
 
 //+------------------------------------------------------------------+
-//| Get current position direction - Safe                            |
+//| Get current day                                                  |
 //+------------------------------------------------------------------+
-int GetPositionDirection() {
-   int total = PositionsTotal();
-   for(int i = total - 1; i >= 0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket > 0 && PositionSelectByTicket(ticket)) {
-         if(PositionGetString(POSITION_SYMBOL) == _Symbol) {
-            return (int)PositionGetInteger(POSITION_TYPE);
-         }
-      }
-   }
-   return -1;
+int GetDay() {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return dt.day;
 }
 
 //+------------------------------------------------------------------+
-//| Calculate OFI using Bars - Wine Stable                          |
+//| Calculate Order Flow Imbalance                                   |
 //+------------------------------------------------------------------+
-double CalculateOFI() {
-   double buyVolume = 0;
-   double sellVolume = 0;
+double OFI() {
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
    
-   MqlRates rates[];
-   ArraySetAsSeries(rates, true);
-   int copied = CopyRates(_Symbol, PERIOD_M1, 0, LookbackBars, rates);
+   if(CopyRates(_Symbol, PERIOD_M1, 0, 15, r) < 15) {
+      return 1.0;
+   }
    
-   if(copied < LookbackBars) return 1.0;
+   double buyVol = 0;
+   double sellVol = 0;
    
-   for(int i = 0; i < LookbackBars; i++) {
-      if(rates[i].close > rates[i].open) {
-         buyVolume += (double)rates[i].tick_volume;
-      } else if(rates[i].close < rates[i].open) {
-         sellVolume += (double)rates[i].tick_volume;
-      }
-      // Equal open/close (doji) - ignore or split 50/50
-      else {
-         buyVolume += (double)rates[i].tick_volume * 0.5;
-         sellVolume += (double)rates[i].tick_volume * 0.5;
+   for(int i = 0; i < 15; i++) {
+      if(r[i].close > r[i].open) {
+         buyVol += (double)r[i].tick_volume;
+      } else if(r[i].close < r[i].open) {
+         sellVol += (double)r[i].tick_volume;
+      } else {
+         // Doji - split volume
+         buyVol += (double)r[i].tick_volume * 0.5;
+         sellVol += (double)r[i].tick_volume * 0.5;
       }
    }
    
-   if(sellVolume < 1) sellVolume = 1;
-   double ratio = buyVolume / sellVolume;
-   lastOFIValue = ratio;
-   
-   return ratio;
+   if(sellVol < 1.0) sellVol = 1.0;
+   return buyVol / sellVol;
 }
 
 //+------------------------------------------------------------------+
 //| Get current spread in pips                                       |
 //+------------------------------------------------------------------+
-double GetSpreadPips() {
+double Spread() {
    long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    
-   // Convert to pips
+   // Convert to pips based on symbol type
    if(StringFind(_Symbol, "JPY") >= 0 || _Symbol == "XAUUSD") {
       return (double)spread * point * 100.0;
-   } else {
-      return (double)spread * point * 10000.0;
    }
+   return (double)spread * point * 10000.0;
 }
 
 //+------------------------------------------------------------------+
-//| Main execution logic - Called by Timer AND OnTick                |
+//| Execute trade                                                    |
 //+------------------------------------------------------------------+
-void ProcessTradeLogic() {
-   // Throttle processing in Wine - max once per 500ms
-   if(TimeCurrent() - lastProcessTime < 1) {
-      return;
-   }
-   lastProcessTime = TimeCurrent();
-   
-   // Daily reset
-   int currentDay = GetCurrentDay();
-   if(currentDay != lastTradeDay) {
-      dailyTrades = 0;
-      lastTradeDay = currentDay;
-      Print("🔄 New trading day - Reset counter");
-   }
-   
-   // Check position status
-   isInTrade = HasOpenPosition();
-   
-   // Trade limits
-   if(dailyTrades >= MaxDailyTrades) return;
-   if(TimeCurrent() - lastTradeTime < (datetime)CooldownSeconds) return;
-   
-   double spread = GetSpreadPips();
-   if(spread > MaxSpreadPips) {
-      static int spreadWarnCount = 0;
-      if(spreadWarnCount++ % 20 == 0) {
-         Print("⚠️ Spread too high: ", spread, " pips");
-      }
+void Trade(bool buy, double ofi) {
+   MqlTick t;
+   if(!SymbolInfoTick(_Symbol, t)) {
       return;
    }
    
-   // Don't trade if already in position
-   if(isInTrade) return;
-   
-   // Calculate OFI
-   double ofiRatio = CalculateOFI();
-   
-   // AGGRESSIVE ENTRY CONDITIONS
-   bool signalBuy = (ofiRatio >= OFIThreshold);
-   bool signalSell = (ofiRatio <= 1.0 / OFIThreshold);
-   
-   // Execute trades immediately
-   if(signalBuy) {
-      ExecuteTrade("BUY", ofiRatio);
-   } else if(signalSell) {
-      ExecuteTrade("SELL", ofiRatio);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Execute Trade - Safe version                                     |
-//+------------------------------------------------------------------+
-void ExecuteTrade(string action, double ofiRatio) {
-   MqlTick currentTick;
-   if(!SymbolInfoTick(_Symbol, currentTick)) {
-      Print("❌ Failed to get tick data");
-      return;
-   }
-   
-   double price, tp, sl;
-   ENUM_ORDER_TYPE orderType;
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    
-   // Calculate pip value correctly
+   // Calculate pip size
    double pipSize;
    if(StringFind(_Symbol, "JPY") >= 0 || _Symbol == "XAUUSD") {
       pipSize = point * 100.0;
@@ -246,108 +159,100 @@ void ExecuteTrade(string action, double ofiRatio) {
       pipSize = point * 10000.0;
    }
    
-   if(action == "BUY") {
-      price = currentTick.ask;
-      sl = price - StopLossPips * pipSize;
-      tp = price + TakeProfitPips * pipSize;
-      orderType = ORDER_TYPE_BUY;
-   } else {
-      price = currentTick.bid;
-      sl = price + StopLossPips * pipSize;
-      tp = price - TakeProfitPips * pipSize;
-      orderType = ORDER_TYPE_SELL;
-   }
+   double price = buy ? t.ask : t.bid;
+   double sl = buy ? price - SL * pipSize : price + SL * pipSize;
+   double tp = buy ? price + TP * pipSize : price - TP * pipSize;
    
-   MqlTradeRequest request = {};
-   MqlTradeResult result = {};
+   MqlTradeRequest req = {};
+   MqlTradeResult res = {};
    
-   request.action = TRADE_ACTION_DEAL;
-   request.symbol = _Symbol;
-   request.volume = LotSize;
-   request.type = orderType;
-   request.price = price;
-   request.sl = NormalizeDouble(sl, digits);
-   request.tp = NormalizeDouble(tp, digits);
-   request.deviation = 20;
-   request.magic = 202603;
-   request.comment = "OFI_" + DoubleToString(ofiRatio, 2) + "x";
-   request.type_filling = ORDER_FILLING_IOC;  // FIXED: Use IOC only - FOK fails on many brokers
-   request.type_time = ORDER_TIME_GTC;
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = _Symbol;
+   req.volume = LotSize;
+   req.type = buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.price = price;
+   req.sl = NormalizeDouble(sl, digits);
+   req.tp = NormalizeDouble(tp, digits);
+   req.deviation = 30;  // 🔥 Allow slippage for fast fills
+   req.magic = 555000;
+   req.type_filling = ORDER_FILLING_IOC;  // 🔥 Immediate or Cancel
+   req.type_time = ORDER_TIME_GTC;
+   req.comment = "OFI_" + DoubleToString(ofi, 2) + "x";
    
-   if(OrderSend(request, result)) {
-      if(result.retcode == TRADE_RETCODE_DONE) {
-         dailyTrades++;
-         lastTradeTime = TimeCurrent();
-         Print("✅ ", action, " EXECUTED | OFI: ", DoubleToString(ofiRatio, 2), 
-               "x | Price: ", price, " | Trades Today: ", dailyTrades);
-      } else {
-         Print("⚠️ Order placed but retcode: ", result.retcode);
+   if(OrderSend(req, res)) {
+      if(res.retcode == TRADE_RETCODE_DONE) {
+         trades++;
+         lastTrade = TimeCurrent();
+         Print("⚡ TRADE ", buy ? "BUY" : "SELL", 
+               " | OFI: ", DoubleToString(ofi, 2), 
+               "x | Price: ", price,
+               " | Trades: ", trades);
       }
-   } else {
-      int error = GetLastError();
-      Print("❌ OrderSend failed. Error: ", error);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Timer handler - Called every 1 second                            |
+//| Main processing logic                                            |
 //+------------------------------------------------------------------+
-void OnTimer() {
-   ProcessTradeLogic();
+void Process() {
+   // Daily reset
+   int currentDay = GetDay();
+   if(currentDay != lastTradeDay) {
+      trades = 0;
+      lastTradeDay = currentDay;
+   }
    
-   // Status report every 60 iterations (60 seconds)
-   static int reportCounter = 0;
-   reportCounter++;
-   if(reportCounter >= 60) {
-      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      double profit = balance - initialBalance;
-      Print("📊 BAL: $", DoubleToString(balance, 2), 
-            " | P/L: $", DoubleToString(profit, 2),
-            " | Trades: ", dailyTrades,
-            " | OFI: ", DoubleToString(lastOFIValue, 2), "x",
-            " | Spread: ", GetSpreadPips(), " pips");
-      reportCounter = 0;
+   // Trade limits
+   if(trades >= MaxTrades) {
+      return;
+   }
+   
+   // No overlapping positions
+   if(HasPos()) {
+      return;
+   }
+   
+   // Spread check
+   if(Spread() > MaxSpread) {
+      return;
+   }
+   
+   // Calculate OFI and execute
+   double ofi = OFI();
+   
+   if(ofi >= Threshold) {
+      Trade(true, ofi);
+   } else if(ofi <= 1.0 / Threshold) {
+      Trade(false, ofi);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Tick handler - Fallback for aggressive scanning                  |
+//| Tick handler - Primary trigger                                   |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // Process every tick for maximum trade frequency
-   ProcessTradeLogic();
+   Process();
 }
 
 //+------------------------------------------------------------------+
-//| Position close monitor - Safe history access                     |
+//| Timer handler - Backup trigger (every 1 second)                  |
 //+------------------------------------------------------------------+
-void OnTrade() {
-   // Check if position was closed
-   static bool wasInTrade = false;
-   bool currentlyInTrade = HasOpenPosition();
+void OnTimer() {
+   Process();
    
-   if(wasInTrade && !currentlyInTrade) {
-      // Position just closed - safely check history
-      HistorySelect(TimeCurrent() - 300, TimeCurrent());  // Last 5 minutes
-      int total = HistoryDealsTotal();
-      
-      for(int i = total - 1; i >= 0; i--) {
-         ulong ticket = HistoryDealGetTicket(i);
-         if(ticket > 0) {
-            if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT) {
-               if(HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol) {
-                  double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
-                  if(profit < 0) consecutiveLosses++;
-                  else consecutiveLosses = 0;
-                  Print(profit >= 0 ? "🟢 Closed: +$" : "🔴 Closed: -$", 
-                        DoubleToString(MathAbs(profit), 2));
-                  break;
-               }
-            }
-         }
-      }
+   // Periodic status report
+   static int counter = 0;
+   counter++;
+   if(counter >= 60) {
+      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double profit = balance - initialBalance;
+      Print("📊 BAL: $", DoubleToString(balance, 2),
+            " | P/L: $", DoubleToString(profit, 2),
+            " | Trades: ", trades,
+            " | OFI: ", DoubleToString(OFI(), 2), "x",
+            " | Spread: ", Spread(), " pips");
+      counter = 0;
    }
-   wasInTrade = currentlyInTrade;
 }
 
 //+------------------------------------------------------------------+
@@ -357,54 +262,42 @@ void OnDeinit(const int reason) {
    EventKillTimer();
    double finalBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    double totalProfit = finalBalance - initialBalance;
-   Print("╔════════════════════════════════════════════╗");
-   Print("║           🔴 BOT SHUTDOWN                   ║");
-   Print("║  Final Balance: $", DoubleToString(finalBalance, 2), "        ║");
-   Print("║  Total P/L: $", DoubleToString(totalProfit, 2), "             ║");
-   Print("║  Total Trades: ", dailyTrades, "                      ║");
-   Print("╚════════════════════════════════════════════╝");
+   Print("╔═══════════════════════════════════════════╗");
+   Print("║           🔴 BOT SHUTDOWN                  ║");
+   Print("║  Final Balance: $", DoubleToString(finalBalance, 2), "       ║");
+   Print("║  Total P/L: $", DoubleToString(totalProfit, 2), "            ║");
+   Print("║  Total Trades: ", trades, "                         ║");
+   Print("╚═══════════════════════════════════════════╝");
 }
 EOF
 
 # ============================================
-# 5. Create compile script with verification
-# ============================================
-RUN cat << 'EOF' > /root/compile_and_verify.sh
-#!/bin/bash
-# Remove the indicator property line that might cause issues
-sed -i '/#property indicator_chart_window/d' /root/OFI_Alpha_Bot.mq5
-echo "✅ Removed indicator property line"
-EOF
-
-RUN chmod +x /root/compile_and_verify.sh
-
-# ============================================
-# 6. Entrypoint with Wine optimization
+# 5. FAST ENTRYPOINT WITH 5-SECOND STIMULATION
 # ============================================
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
 set -e
 
-# Clean up any stale X11 locks
-rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+# Clean up X11 locks
+rm -rf /tmp/.X*
 
 # Start virtual display
 Xvfb :1 -screen 0 1280x800x16 -ac &
-sleep 3
-
-# Start window manager
-fluxbox &
 sleep 2
 
-# Start VNC for debugging (optional)
+# Window manager
+fluxbox &
+sleep 1
+
+# VNC for debugging (optional)
 x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
-websockify --web=/usr/share/novnc/ 8080 localhost:5900 &
+websockify --web=/usr/share/novnc 8080 localhost:5900 &
 
 # Initialize Wine
 wineboot --init
 sleep 5
 
-# Install MT5 if not present
+# Install MT5 if missing
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 if [ ! -f "$MT5_EXE" ]; then
     echo "📦 Installing MT5..."
@@ -418,39 +311,46 @@ wine "$MT5_EXE" &
 sleep 30
 
 # Find MQL5 directory
-DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "MQL5" -type d 2>/dev/null | head -n 1)
+DATA_DIR=$(find /root/.wine -name "MQL5" -type d 2>/dev/null | head -n 1)
 if [ -z "$DATA_DIR" ]; then
     DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 fi
 
 # Copy and compile expert
-EXPERT_PATH="$DATA_DIR/Experts/OFI_Alpha_Bot.mq5"
 mkdir -p "$DATA_DIR/Experts"
-cp /root/OFI_Alpha_Bot.mq5 "$EXPERT_PATH"
+cp /root/FAST_OFI_BOT.mq5 "$DATA_DIR/Experts/FAST_OFI_BOT.mq5"
 
-echo "🔧 Compiling expert..."
+echo "🔧 Compiling FAST_OFI_BOT..."
 EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
-wine "$EDITOR_EXE" /compile:"$EXPERT_PATH" /log:"/root/compile.log"
+wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/FAST_OFI_BOT.mq5" /log:"/root/compile.log" 2>&1
 
-# Check compilation result
-if grep -q "0 error(s)" /root/compile.log; then
-    echo "✅ Compilation successful - 0 errors"
-else
-    echo "⚠️ Compilation warnings/errors found:"
-    cat /root/compile.log
+# Check compilation
+if [ -f "/root/compile.log" ]; then
+    if grep -q "0 error(s)" /root/compile.log; then
+        echo "✅ Compilation SUCCESS - 0 errors"
+    else
+        echo "⚠️ Compilation output:"
+        cat /root/compile.log
+    fi
 fi
 
 # Start MT5 Linux bridge
-echo "🌉 Starting MT5-Linux bridge..."
+echo "🌉 Starting MT5-Linux bridge on port 8001..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
-# Keep container alive and stimulate MT5
-echo "💓 Starting heartbeat stimulation..."
+# 🔥 ULTRA FAST STIMULATION LOOP (5-second intervals)
+echo "💓 Starting 5-second heartbeat stimulation..."
 while true; do
-    # Send F5 refresh to MT5 window every 30 seconds
+    # Send F5 refresh to keep MT5 connection alive
     xdotool search --name "MetaTrader" key F5 2>/dev/null || true
-    sleep 30
+    sleep 5
 done &
+
+echo "╔═══════════════════════════════════════════╗"
+echo "║   🚀 FAST AGGRESSIVE BOT IS RUNNING       ║"
+echo "║   VNC: http://localhost:8080              ║"
+echo "║   Bridge: port 8001                       ║"
+echo "╚═══════════════════════════════════════════╝"
 
 tail -f /dev/null
 EOF
@@ -458,4 +358,5 @@ EOF
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
 
 EXPOSE 8080 8001
+
 CMD ["/bin/bash", "/entrypoint.sh"]
