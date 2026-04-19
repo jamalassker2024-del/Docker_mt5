@@ -35,27 +35,20 @@ RUN cat << 'EOF' > /root/OFI_Tick_Bot.mq5
 //+------------------------------------------------------------------+
 //|                                                  OFI_Tick_Bot.mq5 |
 //|                                    Order Flow Imbalance Scalper   |
-//|                                              For Valetutax Cent   |
 //+------------------------------------------------------------------+
 #property copyright "OFI Bot"
 #property version   "1.00"
 #property strict
 
-//+------------------------------------------------------------------+
-//| Input Parameters                                                 |
-//+------------------------------------------------------------------+
-input double   LotSize = 0.01;              // Lot size (0.01 = 10 cents)
-input int      OFIThreshold = 3;            // Buy/Sell ratio threshold (3x)
-input int      LookbackTicks = 50;          // Number of ticks to analyze
-input int      TakeProfitPips = 10;         // Take profit in pips
-input int      StopLossPips = 8;            // Stop loss in pips
-input int      MaxSpreadPips = 3;           // Max spread to trade
-input int      CooldownSeconds = 3;         // Cooldown after trade
-input int      MaxDailyTrades = 100;        // Max trades per day
+input double   LotSize = 0.01;
+input int      OFIThreshold = 3;
+input int      LookbackTicks = 50;
+input int      TakeProfitPips = 10;
+input int      StopLossPips = 8;
+input int      MaxSpreadPips = 3;
+input int      CooldownSeconds = 3;
+input int      MaxDailyTrades = 100;
 
-//+------------------------------------------------------------------|
-//| Global Variables                                                 |
-//+------------------------------------------------------------------|
 struct TickData {
    datetime time;
    double   price;
@@ -70,33 +63,18 @@ int      dailyTrades = 0;
 int      lastTradeDay = 0;
 double   initialBalance = 0;
 
-//+------------------------------------------------------------------|
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------|
 int OnInit() {
    Print("========================================");
    Print("💎 OFI TICK BOT INITIALIZED");
+   Print("   Lot: ", LotSize, " | TP: ", TakeProfitPips, " | SL: ", StopLossPips);
    Print("========================================");
-   Print("   Lot Size: ", LotSize);
-   Print("   OFI Threshold: ", OFIThreshold, "x");
-   Print("   TP: ", TakeProfitPips, " pips | SL: ", StopLossPips, " pips");
-   Print("   Lookback Ticks: ", LookbackTicks);
-   Print("========================================");
-   
    ArrayResize(tickBuffer, LookbackTicks);
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   Print("💰 Initial Balance: $", initialBalance);
    lastTradeDay = Day();
-   
-   // Set timer for status updates every 30 seconds
    EventSetTimer(30);
-   
    return(INIT_SUCCEEDED);
 }
 
-//+------------------------------------------------------------------|
-//| Expert tick function                                             |
-//+------------------------------------------------------------------|
 void OnTick() {
    if (Day() != lastTradeDay) {
       dailyTrades = 0;
@@ -146,33 +124,21 @@ void OnTick() {
    }
 }
 
-//+------------------------------------------------------------------|
-//| Calculate Order Flow Imbalance                                   |
-//+------------------------------------------------------------------|
 double CalculateOFI() {
-   int buyTicks = 0;
-   int sellTicks = 0;
-   
+   int buyTicks = 0, sellTicks = 0;
    for (int i = 0; i < LookbackTicks; i++) {
       int idx = (tickCount - LookbackTicks + i) % LookbackTicks;
       if (tickBuffer[idx].isBuy) buyTicks++;
       else sellTicks++;
    }
-   
    if (sellTicks == 0) return (buyTicks > 0) ? 999.0 : 1.0;
    return (double)buyTicks / (double)sellTicks;
 }
 
-//+------------------------------------------------------------------|
-//| Get current spread in pips                                       |
-//+------------------------------------------------------------------|
 double GetSpreadPips() {
    return SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) / 10.0;
 }
 
-//+------------------------------------------------------------------|
-//| Check and execute trade                                          |
-//+------------------------------------------------------------------|
 void CheckAndExecuteTrade(string action, double ofiRatio) {
    if (dailyTrades >= MaxDailyTrades) return;
    if (TimeCurrent() - lastTradeTime < CooldownSeconds) return;
@@ -233,37 +199,23 @@ void CheckAndExecuteTrade(string action, double ofiRatio) {
    }
 }
 
-//+------------------------------------------------------------------|
-//| Timer function                                                   |
-//+------------------------------------------------------------------|
 void OnTimer() {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double profit = balance - initialBalance;
-   double roi = (profit / initialBalance) * 100;
-   Print("📊 Balance: $", balance, " | Profit: $", profit, " | ROI: ", roi, "% | Trades: ", dailyTrades);
+   Print("📊 Balance: $", balance, " | Profit: $", profit, " | Trades: ", dailyTrades);
 }
 
-//+------------------------------------------------------------------|
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------|
 void OnDeinit(const int reason) {
-   double finalBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   Print("========================================");
-   Print("🔴 OFI BOT SHUTDOWN");
-   Print("   Final Balance: $", finalBalance);
-   Print("   Total Profit: $", finalBalance - initialBalance);
-   Print("========================================");
+   Print("🔴 OFI BOT SHUTDOWN | Final Balance: $", AccountInfoDouble(ACCOUNT_BALANCE));
 }
-//+------------------------------------------------------------------|
+//+------------------------------------------------------------------+
 EOF
 
 # ============================================
-# 5. Create Complete Entrypoint Script
+# 5. Create Complete Entrypoint Script (FIXED PATHS)
 # ============================================
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
-
-set -e
 
 echo "=========================================="
 echo "💎 MT5 + MQL5 OFI BOT - RAILWAY READY"
@@ -288,60 +240,64 @@ echo "Initializing Wine..."
 wineboot --init
 sleep 5
 
-# Find and start MT5
-MT5_1="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-MT5_2="/root/.wine/drive_c/Program Files (x86)/MetaTrader 5/terminal64.exe"
+# Find or install MT5
+MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 
-if [ -f "$MT5_1" ]; then
-    echo "Starting MT5 (64bit)"
-    wine "$MT5_1" &
-    MT5_PATH="$MT5_1"
-elif [ -f "$MT5_2" ]; then
-    echo "Starting MT5 (x86)"
-    wine "$MT5_2" &
-    MT5_PATH="$MT5_2"
-else
+if [ ! -f "$MT5_EXE" ]; then
     echo "Installing MT5 for first time..."
     wine /root/mt5setup.exe &
-    sleep 30
-    if [ -f "$MT5_1" ]; then
-        MT5_PATH="$MT5_1"
-        wine "$MT5_1" &
-    elif [ -f "$MT5_2" ]; then
-        MT5_PATH="$MT5_2"
-        wine "$MT5_2" &
-    fi
+    echo "Waiting for installation (60 seconds)..."
+    sleep 60
 fi
 
-echo "Waiting for MT5 to load..."
+# Start MT5 to generate data folder
+echo "Starting MT5 to generate profile..."
+wine "$MT5_EXE" &
 sleep 30
 
-# Install MQL5 bot
-echo "Installing MQL5 bot..."
-MT5_DIR=$(dirname "$MT5_PATH")
-MQL5_DIR="$MT5_DIR/MQL5/Experts"
-mkdir -p "$MQL5_DIR"
-cp /root/OFI_Tick_Bot.mq5 "$MQL5_DIR/OFI_Tick_Bot.mq5"
-echo "✅ Bot installed as 'OFI_Tick_Bot'"
+# Locate the REAL MQL5 Experts folder (AppData, not Program Files)
+echo "Locating MQL5 data directory..."
+DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "MQL5" -type d 2>/dev/null | head -n 1)
 
-# Start bridge (optional)
+if [ -z "$DATA_DIR" ]; then
+    echo "AppData folder not found, using fallback location..."
+    DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
+fi
+
+EXPERT_PATH="$DATA_DIR/Experts/OFI_Tick_Bot.mq5"
+mkdir -p "$DATA_DIR/Experts"
+
+# Copy and compile the bot
+echo "Installing bot to: $EXPERT_PATH"
+cp /root/OFI_Tick_Bot.mq5 "$EXPERT_PATH"
+
+echo "Compiling bot with MetaEditor..."
+wine "$EDITOR_EXE" /compile:"$EXPERT_PATH" /log:"/root/compile.log"
+
+echo "Compilation log:"
+cat /root/compile.log 2>/dev/null || echo "No compile log found"
+
+# Start mt5linux bridge (optional)
 echo "Starting mt5linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
 echo "=========================================="
-echo "✅ MT5 is running with OFI Bot"
-echo "🌐 Open: https://your-app.up.railway.app:8080/vnc.html"
+echo "✅ SETUP COMPLETE"
 echo "=========================================="
+echo "📍 Bot installed at: $EXPERT_PATH"
+echo "📍 Compiled to: ${EXPERT_PATH/.mq5/.ex5}"
 echo ""
-echo "📌 MANUAL STEPS:"
-echo "   1. Login to Valetutax account"
-echo "   2. Open Navigator (Ctrl+N)"
-echo "   3. Find 'OFI_Tick_Bot' under Expert Advisors"
-echo "   4. Drag it to any chart"
-echo "   5. Enable Auto-Trading"
-echo ""
+echo "📌 HOW TO USE:"
+echo "   1. Open noVNC in your browser"
+echo "   2. Login to Valetutax account"
+echo "   3. Press Ctrl+N to open Navigator"
+echo "   4. Right-click 'Expert Advisors' → Refresh"
+echo "   5. Find 'OFI_Tick_Bot' and drag to chart"
+echo "   6. Enable Auto-Trading (top toolbar)"
+echo "=========================================="
 
-# Keep alive
+# Keep container alive
 tail -f /dev/null
 EOF
 
