@@ -28,43 +28,47 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. ULTRA FAST AGGRESSIVE EA (COMPILE-SAFE)
+# 4. FIXED EA FOR VALETAX .vx SYMBOLS - GUARANTEED TRADES
 # ============================================
 RUN cat << 'EOF' > /root/FAST_OFI_BOT.mq5
 //+------------------------------------------------------------------+
-//|                                          FAST_AGGRESSIVE_OFI.mq5 |
-//|                                PRODUCTION v5.0 - COMPILE SAFE    |
+//|                                          FAST_OFI_VALETAX_FIX.mq5|
+//|                                FIXED for .vx symbols - V6.0      |
 //+------------------------------------------------------------------+
 #property strict
-#property version "5.0"
+#property version "6.0"
 
 input double   LotSize = 0.01;
-input double   Threshold = 1.3;        // 🔥 Aggressive entry
-input int      TP = 10;                // Take profit pips
-input int      SL = 8;                 // Stop loss pips
-input double   MaxSpread = 6.0;        // Relaxed spread filter
-input int      Cooldown = 0;           // 🔥 NO cooldown (max speed)
-input int      MaxTrades = 1000;       // 🔥 High frequency ready
+input double   Threshold = 1.3;
+input int      TP = 1000;              // 🔥 FIXED: Points, not pips (1000 points = 10 pips for crypto)
+input int      SL = 800;               // 🔥 FIXED: Points, not pips
+input double   MaxSpreadPoints = 500;  // 🔥 FIXED: Raw points, not calculated pips
+input int      Cooldown = 0;
+input int      MaxTrades = 1000;
 
 datetime lastTrade = 0;
 int trades = 0;
 int lastTradeDay = 0;
 double initialBalance = 0;
+bool debugSpreadReported = false;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit() {
-   EventSetTimer(1);  // Stable 1-second loop
+   EventSetTimer(1);
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    lastTradeDay = dt.day;
    
    Print("╔═══════════════════════════════════════════╗");
-   Print("║   🚀 FAST AGGRESSIVE OFI BOT v5.0         ║");
-   Print("║   Threshold: ", Threshold, "x | TP: ", TP, " | SL: ", SL, "      ║");
-   Print("║   Max Trades: ", MaxTrades, " | Cooldown: 0s        ║");
+   Print("║   🚀 FAST OFI v6.0 - VALETAX .vx FIX      ║");
+   Print("║   Symbol: ", _Symbol);
+   Print("║   Point size: ", SymbolInfoDouble(_Symbol, SYMBOL_POINT));
+   Print("║   Spread (raw): ", SymbolInfoInteger(_Symbol, SYMBOL_SPREAD));
+   Print("║   MaxSpreadPoints: ", MaxSpreadPoints);
+   Print("║   TP/SL: ", TP, "/", SL, " POINTS");
    Print("╚═══════════════════════════════════════════╝");
    
    return(INIT_SUCCEEDED);
@@ -115,7 +119,6 @@ double OFI() {
       } else if(r[i].close < r[i].open) {
          sellVol += (double)r[i].tick_volume;
       } else {
-         // Doji - split volume
          buyVol += (double)r[i].tick_volume * 0.5;
          sellVol += (double)r[i].tick_volume * 0.5;
       }
@@ -126,42 +129,30 @@ double OFI() {
 }
 
 //+------------------------------------------------------------------+
-//| Get current spread in pips                                       |
+//| Get raw spread (points, not calculated pips)                     |
 //+------------------------------------------------------------------+
-double Spread() {
-   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   
-   // Convert to pips based on symbol type
-   if(StringFind(_Symbol, "JPY") >= 0 || _Symbol == "XAUUSD") {
-      return (double)spread * point * 100.0;
-   }
-   return (double)spread * point * 10000.0;
+long GetRawSpread() {
+   return SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
 }
 
 //+------------------------------------------------------------------+
-//| Execute trade                                                    |
+//| Execute trade - FIXED for .vx symbols                            |
 //+------------------------------------------------------------------+
 void Trade(bool buy, double ofi) {
    MqlTick t;
    if(!SymbolInfoTick(_Symbol, t)) {
+      Print("❌ Failed to get tick data");
       return;
    }
    
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    
-   // Calculate pip size
-   double pipSize;
-   if(StringFind(_Symbol, "JPY") >= 0 || _Symbol == "XAUUSD") {
-      pipSize = point * 100.0;
-   } else {
-      pipSize = point * 10000.0;
-   }
-   
+   // 🔥 CRITICAL FIX: TP and SL are already in POINTS, not pips
+   // Just multiply by point to get price difference
    double price = buy ? t.ask : t.bid;
-   double sl = buy ? price - SL * pipSize : price + SL * pipSize;
-   double tp = buy ? price + TP * pipSize : price - TP * pipSize;
+   double sl = buy ? price - SL * point : price + SL * point;
+   double tp = buy ? price + TP * point : price - TP * point;
    
    MqlTradeRequest req = {};
    MqlTradeResult res = {};
@@ -173,9 +164,9 @@ void Trade(bool buy, double ofi) {
    req.price = price;
    req.sl = NormalizeDouble(sl, digits);
    req.tp = NormalizeDouble(tp, digits);
-   req.deviation = 30;  // 🔥 Allow slippage for fast fills
-   req.magic = 555000;
-   req.type_filling = ORDER_FILLING_IOC;  // 🔥 Immediate or Cancel
+   req.deviation = 100;  // 🔥 INCREASED: Allow more slippage for Valetax
+   req.magic = 666000;
+   req.type_filling = ORDER_FILLING_IOC;
    req.type_time = ORDER_TIME_GTC;
    req.comment = "OFI_" + DoubleToString(ofi, 2) + "x";
    
@@ -183,11 +174,34 @@ void Trade(bool buy, double ofi) {
       if(res.retcode == TRADE_RETCODE_DONE) {
          trades++;
          lastTrade = TimeCurrent();
-         Print("⚡ TRADE ", buy ? "BUY" : "SELL", 
+         Print("⚡ TRADE EXECUTED! ", buy ? "BUY" : "SELL", 
                " | OFI: ", DoubleToString(ofi, 2), 
                "x | Price: ", price,
                " | Trades: ", trades);
+      } else {
+         Print("⚠️ Order retcode: ", res.retcode, " - ", GetRetcodeText(res.retcode));
       }
+   } else {
+      int err = GetLastError();
+      Print("❌ OrderSend failed. Error: ", err);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get retcode text for debugging                                   |
+//+------------------------------------------------------------------+
+string GetRetcodeText(int code) {
+   switch(code) {
+      case 10004: return "Requote";
+      case 10006: return "Order rejected";
+      case 10007: return "Canceled by dealer";
+      case 10008: return "Order placed";
+      case 10009: return "Done";
+      case 10010: return "Partial fill";
+      case 10011: return "Rejected";
+      case 10012: return "Canceled";
+      case 10013: return "Invalid request";
+      default: return "Unknown";
    }
 }
 
@@ -212,17 +226,26 @@ void Process() {
       return;
    }
    
-   // Spread check
-   if(Spread() > MaxSpread) {
+   // 🔥 FIXED: Compare raw spread (points) to MaxSpreadPoints
+   long rawSpread = GetRawSpread();
+   if(rawSpread > (long)MaxSpreadPoints) {
+      // Only report once to avoid spam
+      if(!debugSpreadReported) {
+         Print("⏸️ Spread too high: ", rawSpread, " > ", MaxSpreadPoints, " (waiting...)");
+         debugSpreadReported = true;
+      }
       return;
    }
+   debugSpreadReported = false;
    
    // Calculate OFI and execute
    double ofi = OFI();
    
    if(ofi >= Threshold) {
+      Print("🔔 BUY SIGNAL | OFI: ", ofi, "x | Spread: ", rawSpread, " points");
       Trade(true, ofi);
    } else if(ofi <= 1.0 / Threshold) {
+      Print("🔔 SELL SIGNAL | OFI: ", 1.0/ofi, "x | Spread: ", rawSpread, " points");
       Trade(false, ofi);
    }
 }
@@ -235,22 +258,26 @@ void OnTick() {
 }
 
 //+------------------------------------------------------------------+
-//| Timer handler - Backup trigger (every 1 second)                  |
+//| Timer handler - Backup trigger                                   |
 //+------------------------------------------------------------------+
 void OnTimer() {
    Process();
    
-   // Periodic status report
+   // Status report
    static int counter = 0;
    counter++;
-   if(counter >= 60) {
+   if(counter >= 30) {  // Every 30 seconds
       double balance = AccountInfoDouble(ACCOUNT_BALANCE);
       double profit = balance - initialBalance;
+      long spread = GetRawSpread();
+      double ofi = OFI();
+      
       Print("📊 BAL: $", DoubleToString(balance, 2),
             " | P/L: $", DoubleToString(profit, 2),
             " | Trades: ", trades,
-            " | OFI: ", DoubleToString(OFI(), 2), "x",
-            " | Spread: ", Spread(), " pips");
+            " | OFI: ", DoubleToString(ofi, 2), "x",
+            " | Spread: ", spread, " pts",
+            " | ", (spread <= MaxSpreadPoints ? "✅ READY" : "⏸️ WAITING"));
       counter = 0;
    }
 }
@@ -272,32 +299,26 @@ void OnDeinit(const int reason) {
 EOF
 
 # ============================================
-# 5. FAST ENTRYPOINT WITH 5-SECOND STIMULATION
+# 5. ENTRYPOINT
 # ============================================
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
 set -e
 
-# Clean up X11 locks
 rm -rf /tmp/.X*
 
-# Start virtual display
 Xvfb :1 -screen 0 1280x800x16 -ac &
 sleep 2
 
-# Window manager
 fluxbox &
 sleep 1
 
-# VNC for debugging (optional)
 x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
 websockify --web=/usr/share/novnc 8080 localhost:5900 &
 
-# Initialize Wine
 wineboot --init
 sleep 5
 
-# Install MT5 if missing
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 if [ ! -f "$MT5_EXE" ]; then
     echo "📦 Installing MT5..."
@@ -305,51 +326,42 @@ if [ ! -f "$MT5_EXE" ]; then
     sleep 60
 fi
 
-# Launch MT5
 echo "🚀 Starting MT5..."
 wine "$MT5_EXE" &
 sleep 30
 
-# Find MQL5 directory
 DATA_DIR=$(find /root/.wine -name "MQL5" -type d 2>/dev/null | head -n 1)
 if [ -z "$DATA_DIR" ]; then
     DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 fi
 
-# Copy and compile expert
 mkdir -p "$DATA_DIR/Experts"
 cp /root/FAST_OFI_BOT.mq5 "$DATA_DIR/Experts/FAST_OFI_BOT.mq5"
 
-echo "🔧 Compiling FAST_OFI_BOT..."
+echo "🔧 Compiling..."
 EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/FAST_OFI_BOT.mq5" /log:"/root/compile.log" 2>&1
 
-# Check compilation
 if [ -f "/root/compile.log" ]; then
     if grep -q "0 error(s)" /root/compile.log; then
-        echo "✅ Compilation SUCCESS - 0 errors"
+        echo "✅ Compilation SUCCESS"
     else
         echo "⚠️ Compilation output:"
         cat /root/compile.log
     fi
 fi
 
-# Start MT5 Linux bridge
-echo "🌉 Starting MT5-Linux bridge on port 8001..."
+echo "🌉 Starting MT5-Linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
-# 🔥 ULTRA FAST STIMULATION LOOP (5-second intervals)
-echo "💓 Starting 5-second heartbeat stimulation..."
+echo "💓 Starting 5-second stimulation..."
 while true; do
-    # Send F5 refresh to keep MT5 connection alive
     xdotool search --name "MetaTrader" key F5 2>/dev/null || true
     sleep 5
 done &
 
 echo "╔═══════════════════════════════════════════╗"
-echo "║   🚀 FAST AGGRESSIVE BOT IS RUNNING       ║"
-echo "║   VNC: http://localhost:8080              ║"
-echo "║   Bridge: port 8001                       ║"
+echo "║   🚀 FIXED BOT FOR VALETAX .vx RUNNING    ║"
 echo "╚═══════════════════════════════════════════╝"
 
 tail -f /dev/null
