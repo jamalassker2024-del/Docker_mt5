@@ -9,142 +9,300 @@ ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
 # ============================================
-# 1. Install Dependencies (FAST + CLEAN)
+# 1. Install Wine and Dependencies
 # ============================================
-RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y \
+RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
-    xvfb x11vnc fluxbox novnc websockify \
-    wget curl unzip procps cabextract dos2unix \
+    xvfb x11vnc fluxbox \
+    novnc websockify wget curl procps cabextract \
+    unzip dos2unix \
     libxt6 libxrender1 libxext6 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ============================================
-# 2. Python libs
+# 2. Install Python deps
 # ============================================
 RUN pip install --no-cache-dir mt5linux rpyc
 
 # ============================================
-# 3. Download MT5
+# 3. Download MT5 Installer
 # ============================================
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. CREATE HFT BOT
+# 4. Create MQL5 Bot Code (HFT OPTIMIZED)
 # ============================================
-RUN cat > /root/OFI_HFT_Bot.mq5 << 'EOF'
+RUN cat > /root/OFI_Tick_Bot.mq5 << 'EOF'
 //+------------------------------------------------------------------+
+//|                                          HFT_OFI_Bot.mq5         |
+//|                                    High Frequency Order Flow     |
+//+------------------------------------------------------------------+
+#property copyright "HFT Bot"
+#property version   "2.00"
 #property strict
 
-input double LotSize=0.01;
-input int OFIThreshold=2;
-input int LookbackTicks=20;
-input int TP=3;
-input int SL=2;
-input int MaxSpread=2;
-input int MaxPositions=10;
+// ========== HFT OPTIMIZED SETTINGS ==========
+input double   LotSize = 0.01;
+input int      OFIThreshold = 2;              // Lower for more signals
+input int      LookbackTicks = 20;            // Faster response
+input int      TakeProfitPips = 3;            // Tiny TP for HFT
+input int      StopLossPips = 2;              // Tiny SL
+input int      MaxSpreadPips = 2;             // Tight spread
+input int      CooldownSeconds = 0;           // NO COOLDOWN
+input int      MaxDailyTrades = 1000;         // High limit
+input int      MaxConcurrentTrades = 10;      // Multiple positions
 
-struct T{
- double p; bool b; long v;
+struct TickData {
+   datetime time;
+   double   price;
+   bool     isBuy;
+   long     volume;
 };
 
-T buf[];
-int c=0;
+TickData tickBuffer[];
+int      tickCount = 0;
+datetime lastTradeTime = 0;
+int      dailyTrades = 0;
+int      lastTradeDay = 0;
+double   initialBalance = 0;
+bool     isConnected = false;
 
-double pip(){ return (_Digits==3||_Digits==5)?_Point*10:_Point; }
-
-double spread(){
- return (SymbolInfoDouble(_Symbol,SYMBOL_ASK)-SymbolInfoDouble(_Symbol,SYMBOL_BID))/pip();
+int GetCurrentDay() {
+   MqlDateTime tm;
+   TimeToStruct(TimeCurrent(), tm);
+   return tm.day;
 }
 
-int OnInit(){
- ArrayResize(buf,LookbackTicks);
- return(INIT_SUCCEEDED);
+double GetPipValue() {
+   return (_Digits == 3 || _Digits == 5) ? _Point * 10 : _Point;
 }
 
-void OnTick(){
+double GetSpreadPips() {
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0 || bid <= 0) return 999;
+   double pip = GetPipValue();
+   return (ask - bid) / pip;
+}
 
- if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
- if(PositionsTotal()>MaxPositions) return;
- if(spread()>MaxSpread) return;
+int OnInit() {
+   Print("========================================");
+   Print("HFT OFI BOT INITIALIZED");
+   Print("========================================");
+   Print("Lot: ", LotSize);
+   Print("TP: ", TakeProfitPips, " pips | SL: ", StopLossPips, " pips");
+   Print("OFI Threshold: ", OFIThreshold, "x");
+   Print("Max Concurrent: ", MaxConcurrentTrades);
+   Print("========================================");
+   
+   ArrayResize(tickBuffer, LookbackTicks);
+   initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   lastTradeDay = GetCurrentDay();
+   
+   if(initialBalance > 0) {
+      isConnected = true;
+      Print("Account Balance: $", initialBalance);
+   }
+   
+   EventSetTimer(10);
+   return(INIT_SUCCEEDED);
+}
 
- MqlTick t;
- if(!SymbolInfoTick(_Symbol,t)) return;
+void OnTick() {
+   if(!isConnected) {
+      double checkBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      if(checkBalance > 0) {
+         isConnected = true;
+         initialBalance = checkBalance;
+         Print("Broker connected! Balance: $", initialBalance);
+      }
+      return;
+   }
+   
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
+   
+   int currentDay = GetCurrentDay();
+   if(currentDay != lastTradeDay) {
+      dailyTrades = 0;
+      lastTradeDay = currentDay;
+   }
+   
+   MqlTick currentTick;
+   if(!SymbolInfoTick(_Symbol, currentTick)) return;
+   if(currentTick.last <= 0) return;
+   
+   bool isBuyTick = false;
+   if(currentTick.ask > 0 && currentTick.last >= currentTick.ask) {
+      isBuyTick = true;
+   }
+   else if(currentTick.bid > 0 && currentTick.last <= currentTick.bid) {
+      isBuyTick = false;
+   }
+   else {
+      static double lastPrice = 0;
+      if(lastPrice > 0) isBuyTick = (currentTick.last > lastPrice);
+      lastPrice = currentTick.last;
+   }
+   
+   long tickVolume = currentTick.volume;
+   
+   int idx = tickCount % LookbackTicks;
+   tickBuffer[idx].time = TimeCurrent();
+   tickBuffer[idx].price = currentTick.last;
+   tickBuffer[idx].isBuy = isBuyTick;
+   tickBuffer[idx].volume = tickVolume;
+   tickCount++;
+   
+   if(tickCount < LookbackTicks) return;
+   
+   // NO DELAY - Calculate on every tick
+   static int ticksSinceCalc = 0;
+   ticksSinceCalc++;
+   if(ticksSinceCalc < 1) return;  // FIXED: Calculate every tick
+   ticksSinceCalc = 0;
+   
+   // ========== VOLUME-WEIGHTED OFI (REAL EDGE) ==========
+   double buyVol = 0, sellVol = 0;
+   for(int i = 0; i < LookbackTicks; i++) {
+      if(tickBuffer[i].isBuy) {
+         buyVol += tickBuffer[i].volume;
+      } else {
+         sellVol += tickBuffer[i].volume;
+      }
+   }
+   
+   double ofiRatio = (sellVol == 0) ? 99.0 : buyVol / sellVol;
+   
+   // ========== MOMENTUM FILTER ==========
+   double lastPrice = tickBuffer[(tickCount-1) % LookbackTicks].price;
+   double prevPrice = tickBuffer[(tickCount-2) % LookbackTicks].price;
+   bool momentumUp = lastPrice > prevPrice;
+   bool momentumDown = lastPrice < prevPrice;
+   
+   static datetime lastLog = 0;
+   if(TimeCurrent() - lastLog > 5) {
+      double spread = GetSpreadPips();
+      Print("OFI: ", DoubleToString(ofiRatio, 2), "x | Spread: ", DoubleToString(spread, 1), " pips | Trades: ", dailyTrades);
+      lastLog = TimeCurrent();
+   }
+   
+   // ========== CHECK CONCURRENT TRADES LIMIT ==========
+   if(PositionsTotal() >= MaxConcurrentTrades) return;
+   
+   // ========== BUY SIGNAL ==========
+   if(ofiRatio >= OFIThreshold && momentumUp) {
+      if(dailyTrades >= MaxDailyTrades) return;
+      if(TimeCurrent() - lastTradeTime < CooldownSeconds) return;
+      
+      double spread = GetSpreadPips();
+      if(spread > MaxSpreadPips) return;
+      
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(ask <= 0) return;
+      
+      double pipValue = GetPipValue();
+      double price = ask;
+      double tp = price + (TakeProfitPips * pipValue);
+      double sl = price - (StopLossPips * pipValue);
+      
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      price = NormalizeDouble(price, digits);
+      tp = NormalizeDouble(tp, digits);
+      sl = NormalizeDouble(sl, digits);
+      
+      MqlTradeRequest request = {};
+      MqlTradeResult result = {};
+      
+      request.action = TRADE_ACTION_DEAL;
+      request.symbol = _Symbol;
+      request.volume = LotSize;
+      request.type = ORDER_TYPE_BUY;
+      request.price = price;
+      request.sl = sl;
+      request.tp = tp;
+      request.deviation = 5;                    // FIXED: Lower deviation
+      request.magic = 2026;
+      request.comment = StringFormat("OFI_%.1fx", ofiRatio);
+      request.type_filling = ORDER_FILLING_FOK; // FIXED: FOK for HFT
+      request.type_time = ORDER_TIME_GTC;
+      
+      if(OrderSend(request, result)) {
+         if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED) {
+            dailyTrades++;
+            lastTradeTime = TimeCurrent();
+            Print("BUY EXECUTED! OFI: ", DoubleToString(ofiRatio, 1), "x | Entry: ", price);
+         }
+      }
+   }
+   // ========== SELL SIGNAL ==========
+   else if(ofiRatio <= 1.0 / OFIThreshold && OFIThreshold > 1 && momentumDown) {
+      if(dailyTrades >= MaxDailyTrades) return;
+      if(TimeCurrent() - lastTradeTime < CooldownSeconds) return;
+      
+      double spread = GetSpreadPips();
+      if(spread > MaxSpreadPips) return;
+      
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(bid <= 0) return;
+      
+      double pipValue = GetPipValue();
+      double price = bid;
+      double tp = price - (TakeProfitPips * pipValue);
+      double sl = price + (StopLossPips * pipValue);
+      
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      price = NormalizeDouble(price, digits);
+      tp = NormalizeDouble(tp, digits);
+      sl = NormalizeDouble(sl, digits);
+      
+      MqlTradeRequest request = {};
+      MqlTradeResult result = {};
+      
+      request.action = TRADE_ACTION_DEAL;
+      request.symbol = _Symbol;
+      request.volume = LotSize;
+      request.type = ORDER_TYPE_SELL;
+      request.price = price;
+      request.sl = sl;
+      request.tp = tp;
+      request.deviation = 5;
+      request.magic = 2026;
+      request.comment = StringFormat("OFI_%.1fx", ofiRatio);
+      request.type_filling = ORDER_FILLING_FOK;
+      request.type_time = ORDER_TIME_GTC;
+      
+      if(OrderSend(request, result)) {
+         if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED) {
+            dailyTrades++;
+            lastTradeTime = TimeCurrent();
+            Print("SELL EXECUTED! OFI: ", DoubleToString(ofiRatio, 1), "x | Entry: ", price);
+         }
+      }
+   }
+}
 
- bool buy = (t.last>=t.ask);
+void OnTimer() {
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance > 0) {
+      double profit = balance - initialBalance;
+      Print("Balance: $", DoubleToString(balance, 2), " | Profit: $", DoubleToString(profit, 2), " | Trades: ", dailyTrades);
+   }
+}
 
- int i=c%LookbackTicks;
- buf[i].p=t.last;
- buf[i].b=buy;
- buf[i].v=t.volume;
- c++;
-
- if(c<LookbackTicks) return;
-
- double bv=0,sv=0;
- for(int k=0;k<LookbackTicks;k++){
-  if(buf[k].b) bv+=buf[k].v;
-  else sv+=buf[k].v;
- }
-
- double ofi = (sv==0)?99:bv/sv;
-
- double last=buf[(c-1)%LookbackTicks].p;
- double prev=buf[(c-2)%LookbackTicks].p;
-
- bool up = last>prev;
- bool down = last<prev;
-
- double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
- double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
- double p=pip();
-
- // BUY
- if(ofi>=OFIThreshold && up){
-  MqlTradeRequest r={};
-  MqlTradeResult res={};
-
-  r.action=TRADE_ACTION_DEAL;
-  r.symbol=_Symbol;
-  r.volume=LotSize;
-  r.type=ORDER_TYPE_BUY;
-  r.price=ask;
-  r.sl=ask-(SL*p);
-  r.tp=ask+(TP*p);
-  r.deviation=5;
-  r.magic=2026;
-  r.type_filling=ORDER_FILLING_IOC;
-
-  OrderSend(r,res);
- }
-
- // SELL
- if(ofi<=1.0/OFIThreshold && down){
-  MqlTradeRequest r={};
-  MqlTradeResult res={};
-
-  r.action=TRADE_ACTION_DEAL;
-  r.symbol=_Symbol;
-  r.volume=LotSize;
-  r.type=ORDER_TYPE_SELL;
-  r.price=bid;
-  r.sl=bid+(SL*p);
-  r.tp=bid-(TP*p);
-  r.deviation=5;
-  r.magic=2026;
-  r.type_filling=ORDER_FILLING_IOC;
-
-  OrderSend(r,res);
- }
+void OnDeinit(const int reason) {
+   EventKillTimer();
 }
 EOF
 
 # ============================================
-# 5. ENTRYPOINT
+# 5. Create Entrypoint Script
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
 
-echo "STARTING MT5 HFT BOT..."
+echo "=========================================="
+echo "HFT OFI BOT - RAILWAY READY"
+echo "=========================================="
 
 rm -f /tmp/.X1-lock
 
@@ -152,45 +310,74 @@ Xvfb :1 -screen 0 1280x800x16 &
 sleep 2
 
 fluxbox &
-x11vnc -display :1 -forever -nopw -shared -rfbport 5900 &
+x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
 websockify --web=/usr/share/novnc/ 8080 localhost:5900 &
 
 wineboot --init
 sleep 5
 
-# Install MT5 if not exists
-if [ ! -f "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" ]; then
+MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
+
+if [ ! -f "$MT5_EXE" ]; then
     echo "Installing MT5..."
     wine /root/mt5setup.exe /auto /silent &
-    sleep 120
+    sleep 90
 fi
 
 export DISPLAY=:1
 
-# First launch
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" &
-sleep 40
+# Start MT5 to create necessary folders
+wine "$MT5_EXE" &
+sleep 45
 
+# Kill MT5 to free resources for compilation
 wineserver -k
 sleep 5
 
-DATA=$(find /root/.wine -name MQL5 -type d | head -n 1)
+# Find the correct MQL5 folder
+DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "MQL5" -type d 2>/dev/null | head -n 1)
+if [ -z "$DATA_DIR" ]; then
+    DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
+fi
 
-mkdir -p "$DATA/Experts"
-cp /root/OFI_HFT_Bot.mq5 "$DATA/Experts/"
+# Create Experts folder and copy bot
+mkdir -p "$DATA_DIR/Experts"
+cp /root/OFI_Tick_Bot.mq5 "$DATA_DIR/Experts/HFT_OFI_Bot.mq5"
 
-echo "Compiling..."
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" \
-/compile:"$DATA/Experts/OFI_HFT_Bot.mq5"
+# Compile the bot
+echo "Compiling HFT bot..."
+wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/HFT_OFI_Bot.mq5" /log:"/root/compile.log"
 
-sleep 10
+if [ -f "$DATA_DIR/Experts/HFT_OFI_Bot.ex5" ]; then
+    echo "✅ Bot compiled successfully!"
+else
+    echo "⚠️ Compilation may have failed. Check log."
+fi
 
-echo "Starting MT5..."
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" &
+# Restart MT5
+wine "$MT5_EXE" &
 
+# Start bridge
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
-echo "READY → Open noVNC (port 8080)"
+echo "=========================================="
+echo "HFT BOT READY!"
+echo "=========================================="
+echo ""
+echo "SETTINGS:"
+echo "  TP: 3 pips | SL: 2 pips"
+echo "  No cooldown | Max 10 concurrent trades"
+echo "  Volume-weighted OFI | Momentum filter"
+echo ""
+echo "STEPS:"
+echo "1. Open noVNC in browser"
+echo "2. Login to Valetutax"
+echo "3. Open Navigator (Ctrl+N)"
+echo "4. Refresh Expert Advisors"
+echo "5. Drag 'HFT_OFI_Bot' to chart"
+echo "6. Enable Auto-Trading"
+echo ""
 
 tail -f /dev/null
 EOF
