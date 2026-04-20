@@ -1,7 +1,4 @@
-//+------------------------------------------------------------------+
-//|                                                  OFI_Tick_Bot.mq5 |
-//|                                    Order Flow Imbalance Scalper   |
-//+------------------------------------------------------------------+
+
 #property copyright "OFI Bot"
 #property version   "1.00"
 #property strict
