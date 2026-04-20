@@ -16,7 +16,6 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     xvfb x11vnc fluxbox \
     novnc websockify wget curl procps cabextract \
     unzip dos2unix \
-    libxt6 libxrender1 libxext6 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ============================================
@@ -30,7 +29,7 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. Create MQL5 Bot Code (FIXED - using tick_volume)
+# 4. Create MQL5 Bot Code
 # ============================================
 RUN cat << 'EOF' > /root/OFI_Tick_Bot.mq5
 //+------------------------------------------------------------------+
@@ -41,31 +40,22 @@ RUN cat << 'EOF' > /root/OFI_Tick_Bot.mq5
 #property version   "1.00"
 #property strict
 
-//+------------------------------------------------------------------+
-//| Input Parameters                                                 |
-//+------------------------------------------------------------------+
-input double   LotSize = 0.01;              // Lot size (0.01 = 10 cents)
-input int      OFIThreshold = 3;            // Buy/Sell ratio threshold (3x)
-input int      LookbackTicks = 50;          // Number of ticks to analyze
-input int      TakeProfitPips = 10;         // Take profit in pips
-input int      StopLossPips = 8;            // Stop loss in pips
-input int      MaxSpreadPips = 3;           // Max spread to trade
-input int      CooldownSeconds = 3;         // Cooldown after trade
-input int      MaxDailyTrades = 100;        // Max trades per day
+input double   LotSize = 0.01;
+input int      OFIThreshold = 3;
+input int      LookbackTicks = 50;
+input int      TakeProfitPips = 10;
+input int      StopLossPips = 8;
+input int      MaxSpreadPips = 3;
+input int      CooldownSeconds = 3;
+input int      MaxDailyTrades = 100;
 
-//+------------------------------------------------------------------|
-//| Structures                                                       |
-//+------------------------------------------------------------------|
 struct TickData {
    datetime time;
    double   price;
    bool     isBuy;
-   long     volume;                         // Changed to long for tick_volume
+   int      volume;
 };
 
-//+------------------------------------------------------------------|
-//| Global Variables                                                 |
-//+------------------------------------------------------------------|
 TickData tickBuffer[];
 int      tickCount = 0;
 datetime lastTradeTime = 0;
@@ -73,63 +63,52 @@ int      dailyTrades = 0;
 int      lastTradeDay = 0;
 double   initialBalance = 0;
 
-//+------------------------------------------------------------------|
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------|
 int OnInit() {
    Print("========================================");
    Print("💎 OFI TICK BOT INITIALIZED");
    Print("   Lot: ", LotSize, " | TP: ", TakeProfitPips, " | SL: ", StopLossPips);
    Print("========================================");
-   
    ArrayResize(tickBuffer, LookbackTicks);
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   lastTradeDay = TimeDay(TimeCurrent());
-   
+   lastTradeDay = Day();
    EventSetTimer(30);
    return(INIT_SUCCEEDED);
 }
 
-//+------------------------------------------------------------------|
-//| Expert tick function                                             |
-//+------------------------------------------------------------------|
 void OnTick() {
-   // Daily reset
-   if (TimeDay(TimeCurrent()) != lastTradeDay) {
+   if (Day() != lastTradeDay) {
       dailyTrades = 0;
-      lastTradeDay = TimeDay(TimeCurrent());
+      lastTradeDay = Day();
    }
    
    MqlTick currentTick;
-   if(!SymbolInfoTick(_Symbol, currentTick)) return;
+   SymbolInfoTick(_Symbol, currentTick);
    
-   // Determine if tick is buyer or seller aggressive
    bool isBuyTick = false;
-   double tickPrice = currentTick.last;
+   double tickPrice = 0;
    
-   if (currentTick.last >= currentTick.ask) {
+   if (currentTick.ask == currentTick.last) {
       isBuyTick = true;
+      tickPrice = currentTick.ask;
    }
-   else if (currentTick.last <= currentTick.bid) {
+   else if (currentTick.bid == currentTick.last) {
       isBuyTick = false;
+      tickPrice = currentTick.bid;
    }
    else {
       static double lastPrice = 0;
-      isBuyTick = (currentTick.last > lastPrice);
-      lastPrice = currentTick.last;
+      tickPrice = currentTick.last;
+      isBuyTick = (tickPrice > lastPrice);
+      lastPrice = tickPrice;
    }
    
-   // Fill buffer
-   int idx = tickCount % LookbackTicks;
-   tickBuffer[idx].time = currentTick.time;
-   tickBuffer[idx].price = currentTick.last;
-   tickBuffer[idx].isBuy = isBuyTick;
-   tickBuffer[idx].volume = currentTick.tick_volume;  // Use .tick_volume
-   
+   tickBuffer[tickCount % LookbackTicks] = {
+      TimeCurrent(), tickPrice, isBuyTick, (int)currentTick.volume
+   };
    tickCount++;
+   
    if (tickCount < LookbackTicks) return;
    
-   // Calculate OFI every 5 ticks
    static int ticksSinceCalc = 0;
    ticksSinceCalc++;
    if (ticksSinceCalc < 5) return;
@@ -140,52 +119,34 @@ void OnTick() {
    if (ofiRatio >= OFIThreshold) {
       CheckAndExecuteTrade("BUY", ofiRatio);
    }
-   else if (ofiRatio <= 1.0 / (double)OFIThreshold) {
+   else if (ofiRatio <= 1.0 / OFIThreshold) {
       CheckAndExecuteTrade("SELL", ofiRatio);
    }
 }
 
-//+------------------------------------------------------------------|
-//| Calculate Order Flow Imbalance                                   |
-//+------------------------------------------------------------------|
 double CalculateOFI() {
-   int buyTicks = 0;
-   int sellTicks = 0;
-   
+   int buyTicks = 0, sellTicks = 0;
    for (int i = 0; i < LookbackTicks; i++) {
-      if (tickBuffer[i].isBuy) buyTicks++;
+      int idx = (tickCount - LookbackTicks + i) % LookbackTicks;
+      if (tickBuffer[idx].isBuy) buyTicks++;
       else sellTicks++;
    }
-   
-   if (sellTicks == 0) return (buyTicks > 0) ? 99.0 : 1.0;
+   if (sellTicks == 0) return (buyTicks > 0) ? 999.0 : 1.0;
    return (double)buyTicks / (double)sellTicks;
 }
 
-//+------------------------------------------------------------------|
-//| Get current spread in pips                                       |
-//+------------------------------------------------------------------|
 double GetSpreadPips() {
-   return (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) / 10.0;
+   return SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) / 10.0;
 }
 
-//+------------------------------------------------------------------|
-//| Check and execute trade                                          |
-//+------------------------------------------------------------------|
 void CheckAndExecuteTrade(string action, double ofiRatio) {
-   // Daily limit check
    if (dailyTrades >= MaxDailyTrades) return;
-   
-   // Cooldown check
    if (TimeCurrent() - lastTradeTime < CooldownSeconds) return;
-   
-   // Spread check
    if (GetSpreadPips() > MaxSpreadPips) return;
-   
-   // Position already open
    if (PositionSelect(_Symbol)) return;
    
    MqlTick currentTick;
-   if(!SymbolInfoTick(_Symbol, currentTick)) return;
+   SymbolInfoTick(_Symbol, currentTick);
    
    double price, tp, sl;
    int orderType;
@@ -204,7 +165,6 @@ void CheckAndExecuteTrade(string action, double ofiRatio) {
       orderType = ORDER_TYPE_SELL;
    }
    
-   // Dynamic lot sizing
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskPercent = 2.0;
    double riskAmount = balance * (riskPercent / 100.0);
@@ -239,32 +199,20 @@ void CheckAndExecuteTrade(string action, double ofiRatio) {
    }
 }
 
-//+------------------------------------------------------------------|
-//| Timer function for status updates                                |
-//+------------------------------------------------------------------|
 void OnTimer() {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double profit = balance - initialBalance;
-   double roi = (profit / initialBalance) * 100;
-   Print("📊 Balance: $", balance, " | Profit: $", profit, " | ROI: ", roi, "% | Trades: ", dailyTrades);
+   Print("📊 Balance: $", balance, " | Profit: $", profit, " | Trades: ", dailyTrades);
 }
 
-//+------------------------------------------------------------------|
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------|
 void OnDeinit(const int reason) {
-   double finalBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   Print("========================================");
-   Print("🔴 OFI BOT SHUTDOWN");
-   Print("   Final Balance: $", finalBalance);
-   Print("   Total Profit: $", finalBalance - initialBalance);
-   Print("========================================");
+   Print("🔴 OFI BOT SHUTDOWN | Final Balance: $", AccountInfoDouble(ACCOUNT_BALANCE));
 }
 //+------------------------------------------------------------------+
 EOF
 
 # ============================================
-# 5. Create Entrypoint Script (FIXED)
+# 5. Create Complete Entrypoint Script (FIXED PATHS)
 # ============================================
 RUN cat << 'EOF' > /entrypoint.sh
 #!/bin/bash
@@ -303,19 +251,12 @@ if [ ! -f "$MT5_EXE" ]; then
     sleep 60
 fi
 
-# Start MT5 briefly to generate data folder
+# Start MT5 to generate data folder
 echo "Starting MT5 to generate profile..."
-export DISPLAY=:1
 wine "$MT5_EXE" &
-echo "Waiting for MT5 to initialize (30 seconds)..."
 sleep 30
 
-# Kill MT5 to free resources for compilation
-echo "Stopping MT5 for compilation..."
-pkill -9 terminal64.exe 2>/dev/null || true
-sleep 5
-
-# Locate the REAL MQL5 Experts folder
+# Locate the REAL MQL5 Experts folder (AppData, not Program Files)
 echo "Locating MQL5 data directory..."
 DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "MQL5" -type d 2>/dev/null | head -n 1)
 
@@ -332,14 +273,10 @@ echo "Installing bot to: $EXPERT_PATH"
 cp /root/OFI_Tick_Bot.mq5 "$EXPERT_PATH"
 
 echo "Compiling bot with MetaEditor..."
-wine "$EDITOR_EXE" /compile:"$EXPERT_PATH" /log:"/root/compile.log" 2>&1
+wine "$EDITOR_EXE" /compile:"$EXPERT_PATH" /log:"/root/compile.log"
 
 echo "Compilation log:"
-cat /root/compile.log 2>/dev/null || echo "No compile log found (compilation may have succeeded silently)"
-
-# Restart MT5
-echo "Restarting MT5..."
-wine "$MT5_EXE" &
+cat /root/compile.log 2>/dev/null || echo "No compile log found"
 
 # Start mt5linux bridge (optional)
 echo "Starting mt5linux bridge..."
