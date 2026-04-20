@@ -9,7 +9,7 @@ ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
 # ============================================
-# 1. Install Wine and Dependencies (FIXED - removed winetricks)
+# 1. Install Wine and Dependencies
 # ============================================
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
@@ -30,12 +30,13 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. Create MQL5 Bot Code
+# 4. Create MQL5 Bot Code (FULLY FIXED - no tick_volume error)
 # ============================================
 RUN cat > /root/OFI_Tick_Bot.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                                  OFI_Tick_Bot.mq5 |
 //|                                    Order Flow Imbalance Scalper   |
+//|                                          FIXED: tick_volume error |
 //+------------------------------------------------------------------+
 #property copyright "OFI Bot"
 #property version   "1.20"
@@ -141,11 +142,14 @@ void OnTick() {
       lastPrice = currentTick.last;
    }
    
+   // FIXED: استخدام currentTick.volume بدلاً من tick_volume
+   long tickVolume = currentTick.volume;
+   
    int idx = tickCount % LookbackTicks;
    tickBuffer[idx].time = TimeCurrent();
    tickBuffer[idx].price = currentTick.last;
    tickBuffer[idx].isBuy = isBuyTick;
-   tickBuffer[idx].volume = currentTick.tick_volume;
+   tickBuffer[idx].volume = tickVolume;
    tickCount++;
    
    if(tickCount < LookbackTicks) return;
@@ -179,8 +183,7 @@ void OnTick() {
       if(PositionSelect(_Symbol)) return;
       
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(ask <= 0 || bid <= 0) return;
+      if(ask <= 0) return;
       
       double pipValue = GetPipValue();
       double price = ask;
@@ -224,9 +227,8 @@ void OnTick() {
       if(spread > MaxSpreadPips) return;
       if(PositionSelect(_Symbol)) return;
       
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(ask <= 0 || bid <= 0) return;
+      if(bid <= 0) return;
       
       double pipValue = GetPipValue();
       double price = bid;
@@ -304,26 +306,45 @@ EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 
 if [ ! -f "$MT5_EXE" ]; then
     echo "Installing MT5..."
-    wine /root/mt5setup.exe &
-    sleep 60
+    wine /root/mt5setup.exe /auto /silent &
+    sleep 90
 fi
 
 export DISPLAY=:1
+
+# Start MT5 to create necessary folders
 wine "$MT5_EXE" &
-sleep 30
-pkill -9 terminal64.exe 2>/dev/null || true
+sleep 45
+
+# Kill MT5 to free resources for compilation
+wineserver -k
 sleep 5
 
+# Find the correct MQL5 folder
 DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "MQL5" -type d 2>/dev/null | head -n 1)
 if [ -z "$DATA_DIR" ]; then
     DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 fi
 
+# Create Experts folder and copy bot
 mkdir -p "$DATA_DIR/Experts"
 cp /root/OFI_Tick_Bot.mq5 "$DATA_DIR/Experts/"
+
+# Compile the bot using command line
+echo "Compiling bot..."
 wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/OFI_Tick_Bot.mq5" /log:"/root/compile.log"
 
+# Check compilation result
+if [ -f "$DATA_DIR/Experts/OFI_Tick_Bot.ex5" ]; then
+    echo "✅ Bot compiled successfully!"
+else
+    echo "⚠️ Compilation may have failed. Check log."
+fi
+
+# Restart MT5
 wine "$MT5_EXE" &
+
+# Start bridge
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
 echo "=========================================="
@@ -335,7 +356,7 @@ echo "1. Open noVNC in browser"
 echo "2. Login to Valetutax"
 echo "3. Open Navigator (Ctrl+N)"
 echo "4. Right-click 'Expert Advisors' -> Refresh"
-echo "5. Drag 'OFI_Tick_Bot' to EURUSD chart"
+echo "5. Drag 'OFI_Tick_Bot' to chart"
 echo "6. Enable Auto-Trading"
 echo ""
 
