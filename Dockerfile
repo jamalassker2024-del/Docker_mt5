@@ -9,7 +9,7 @@ ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
 # ============================================
-# 1. Install Wine, Dependencies & Clipboard
+# 1. Install Wine & Dependencies
 # ============================================
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
@@ -24,15 +24,9 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
 RUN pip install --no-cache-dir mt5linux rpyc
 
 # ============================================
-# 3. Pre-install Wine & MT5 (Build Stage)
+# 3. Download MT5 (Build stage - just download)
 # ============================================
-RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe && \
-    Xvfb :1 -screen 0 1280x800x16 & \
-    wineboot --init && \
-    sleep 10 && \
-    wine /root/mt5setup.exe /auto /silent && \
-    sleep 60 && \
-    wineserver -k
+RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
 # 4. Create MQL5 Bot Code
@@ -63,24 +57,19 @@ int OnInit() { ArrayResize(tickBuffer, LookbackTicks); lastTradeDay = GetCurrent
 void OnTick() {
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
    MqlTick currentTick; if(!SymbolInfoTick(_Symbol, currentTick)) return;
-   
    bool isBuyTick = (currentTick.last >= currentTick.ask);
    long t_volume = (currentTick.volume > 0) ? currentTick.volume : 1; 
-
    int idx = tickCount % LookbackTicks;
    tickBuffer[idx].price = currentTick.last;
    tickBuffer[idx].isBuy = isBuyTick;
    tickBuffer[idx].volume = t_volume;
    tickCount++;
-   
    if(tickCount < LookbackTicks) return;
-   
    double buyVol = 0, sellVol = 0;
    for(int i = 0; i < LookbackTicks; i++) {
       if(tickBuffer[i].isBuy) buyVol += (double)tickBuffer[i].volume;
       else sellVol += (double)tickBuffer[i].volume;
    }
-   
    double ofiRatio = (sellVol <= 0) ? 99.0 : buyVol / sellVol;
    if(ofiRatio >= OFIThreshold) ExecuteTrade(ORDER_TYPE_BUY, currentTick.ask);
    else if(ofiRatio <= 1.0 / OFIThreshold) ExecuteTrade(ORDER_TYPE_SELL, currentTick.bid);
@@ -104,38 +93,49 @@ void ExecuteTrade(ENUM_ORDER_TYPE type, double price) {
 EOF
 
 # ============================================
-# 5. Entrypoint
+# 5. Entrypoint (Optimized for Railway Health)
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
-# Remove locks from previous runs
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
 
-# Start Display
-Xvfb :1 -screen 0 1280x800x16 &
-sleep 3
-
-# Clipboard & VNC
-autocutsel -fork
-autocutsel -selection PRIMARY -fork
-fluxbox &
-x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
+# 1. IMMEDIATE WEBSERVER START (Tricks Railway Health Check)
+# This ensures Railway sees the container as "Active" immediately
 websockify --web=/usr/share/novnc/ 8080 localhost:5900 &
 
-# Find MQL5 folder
+# 2. Start Virtual Display in background
+Xvfb :1 -screen 0 1280x800x16 &
+sleep 2
+fluxbox &
+autocutsel -fork
+autocutsel -selection PRIMARY -fork
+x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
+
+# 3. Initialize Wine and MT5 if not exists
+if [ ! -d "/root/.wine/drive_c/Program Files/MetaTrader 5" ]; then
+    echo "First time setup: Initializing Wine..."
+    wineboot --init
+    sleep 5
+    echo "Installing MT5..."
+    wine /root/mt5setup.exe /auto /silent
+    sleep 40
+fi
+
+# 4. Handle Bot Files
 DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "MQL5" -type d 2>/dev/null | head -n 1)
 if [ -z "$DATA_DIR" ]; then DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"; fi
 
-# Copy and Compile
 mkdir -p "$DATA_DIR/Experts"
 cp /root/OFI_Tick_Bot.mq5 "$DATA_DIR/Experts/HFT_OFI_Bot.mq5"
+
+# Compile
 wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/HFT_OFI_Bot.mq5" /log:"/root/compile.log"
 
-# Start MT5 & Bridge
+# 5. Run Terminal & Python Bridge
 wine "/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe" &
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
-echo "Container active on port 8080"
+echo "Setup Complete. Bot is running."
 tail -f /dev/null
 EOF
 
