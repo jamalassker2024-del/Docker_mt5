@@ -9,7 +9,7 @@ ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
 # ============================================
-# 1. Install Wine and Dependencies
+# 1. Install Wine and Dependencies (FIXED - removed winetricks)
 # ============================================
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
@@ -17,7 +17,6 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     novnc websockify wget curl procps cabextract \
     unzip dos2unix \
     libxt6 libxrender1 libxext6 \
-    winetricks \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ============================================
@@ -213,7 +212,7 @@ void OnTick() {
          if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED) {
             dailyTrades++;
             lastTradeTime = TimeCurrent();
-            Print("BUY ORDER EXECUTED! OFI: ", DoubleToString(ofiRatio, 1), "x | Entry: ", price);
+            Print("BUY EXECUTED! OFI: ", DoubleToString(ofiRatio, 1), "x | Entry: ", price);
          }
       }
    }
@@ -259,7 +258,7 @@ void OnTick() {
          if(result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED) {
             dailyTrades++;
             lastTradeTime = TimeCurrent();
-            Print("SELL ORDER EXECUTED! OFI: ", DoubleToString(ofiRatio, 1), "x | Entry: ", price);
+            Print("SELL EXECUTED! OFI: ", DoubleToString(ofiRatio, 1), "x | Entry: ", price);
          }
       }
    }
