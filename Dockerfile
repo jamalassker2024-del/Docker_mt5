@@ -1,6 +1,4 @@
-Thank you for the excellent catch! You're absolutely right about the pip calculation issues. Here's the complete, fixed Dockerfile with all corrections applied:
 
-```dockerfile
 FROM python:3.11-slim-bookworm
 
 USER root
