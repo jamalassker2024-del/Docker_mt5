@@ -17,6 +17,7 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     novnc websockify wget curl procps cabextract \
     unzip dos2unix \
     libxt6 libxrender1 libxext6 \
+    gettext-base \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ============================================
@@ -43,14 +44,14 @@ RUN cat > /root/OFI_Tick_Bot.mq5 << 'EOF'
 
 // ========== HFT OPTIMIZED SETTINGS ==========
 input double   LotSize = 0.01;
-input int      OFIThreshold = 2;              // Lower for more signals
-input int      LookbackTicks = 20;            // Faster response
-input int      TakeProfitPips = 3;            // Tiny TP for HFT
-input int      StopLossPips = 2;              // Tiny SL
-input int      MaxSpreadPips = 2;             // Tight spread
-input int      CooldownSeconds = 0;           // NO COOLDOWN
-input int      MaxDailyTrades = 1000;         // High limit
-input int      MaxConcurrentTrades = 10;      // Multiple positions
+input int      OFIThreshold = 2;
+input int      LookbackTicks = 20;
+input int      TakeProfitPips = 3;
+input int      StopLossPips = 2;
+input int      MaxSpreadPips = 2;
+input int      CooldownSeconds = 0;
+input int      MaxDailyTrades = 1000;
+input int      MaxConcurrentTrades = 10;
 
 struct TickData {
    datetime time;
@@ -155,13 +156,12 @@ void OnTick() {
    
    if(tickCount < LookbackTicks) return;
    
-   // NO DELAY - Calculate on every tick
    static int ticksSinceCalc = 0;
    ticksSinceCalc++;
-   if(ticksSinceCalc < 1) return;  // FIXED: Calculate every tick
+   if(ticksSinceCalc < 1) return;
    ticksSinceCalc = 0;
    
-   // ========== VOLUME-WEIGHTED OFI (REAL EDGE) ==========
+   // ========== VOLUME-WEIGHTED OFI ==========
    double buyVol = 0, sellVol = 0;
    for(int i = 0; i < LookbackTicks; i++) {
       if(tickBuffer[i].isBuy) {
@@ -186,7 +186,6 @@ void OnTick() {
       lastLog = TimeCurrent();
    }
    
-   // ========== CHECK CONCURRENT TRADES LIMIT ==========
    if(PositionsTotal() >= MaxConcurrentTrades) return;
    
    // ========== BUY SIGNAL ==========
@@ -220,10 +219,10 @@ void OnTick() {
       request.price = price;
       request.sl = sl;
       request.tp = tp;
-      request.deviation = 5;                    // FIXED: Lower deviation
+      request.deviation = 5;
       request.magic = 2026;
       request.comment = StringFormat("OFI_%.1fx", ofiRatio);
-      request.type_filling = ORDER_FILLING_FOK; // FIXED: FOK for HFT
+      request.type_filling = ORDER_FILLING_FOK;
       request.type_time = ORDER_TIME_GTC;
       
       if(OrderSend(request, result)) {
@@ -295,7 +294,7 @@ void OnDeinit(const int reason) {
 EOF
 
 # ============================================
-# 5. Create Entrypoint Script
+# 5. Create Entrypoint Script (FIXED COMPILATION)
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -327,32 +326,44 @@ fi
 
 export DISPLAY=:1
 
-# Start MT5 to create necessary folders
+# Start MT5 once to generate folders
 wine "$MT5_EXE" &
 sleep 45
-
-# Kill MT5 to free resources for compilation
 wineserver -k
 sleep 5
 
-# Find the correct MQL5 folder
-DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "MQL5" -type d 2>/dev/null | head -n 1)
+# Find the correct MQL5 folder (search for the Include directory)
+DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "Include" -type d 2>/dev/null | sed 's/\/Include//' | head -n 1)
+
 if [ -z "$DATA_DIR" ]; then
+    echo "Using default Program Files path..."
     DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 fi
 
-# Create Experts folder and copy bot
+echo "MQL5 Directory: $DATA_DIR"
+
+# Create Experts folder and copy the bot
 mkdir -p "$DATA_DIR/Experts"
 cp /root/OFI_Tick_Bot.mq5 "$DATA_DIR/Experts/HFT_OFI_Bot.mq5"
 
-# Compile the bot
+# Convert paths to Windows format for MetaEditor
+WIN_MQ5_PATH=$(wine winepath -w "$DATA_DIR/Experts/HFT_OFI_Bot.mq5" 2>/dev/null)
+WIN_INC_PATH=$(wine winepath -w "$DATA_DIR" 2>/dev/null)
+
 echo "Compiling HFT bot..."
-wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/HFT_OFI_Bot.mq5" /log:"/root/compile.log"
+echo "Source: $WIN_MQ5_PATH"
+echo "Include: $WIN_INC_PATH"
+
+# Compile using MetaEditor
+wine "$EDITOR_EXE" /compile:"$WIN_MQ5_PATH" /include:"$WIN_INC_PATH" /log:"/root/compile.log" 2>&1
+
+sleep 5
 
 if [ -f "$DATA_DIR/Experts/HFT_OFI_Bot.ex5" ]; then
-    echo "✅ Bot compiled successfully!"
+    echo "✅ Bot compiled successfully! .ex5 file created."
 else
-    echo "⚠️ Compilation may have failed. Check log."
+    echo "❌ Compilation failed. Showing log:"
+    cat /root/compile.log 2>/dev/null || echo "No log file found"
 fi
 
 # Restart MT5
@@ -374,7 +385,7 @@ echo "STEPS:"
 echo "1. Open noVNC in browser"
 echo "2. Login to Valetutax"
 echo "3. Open Navigator (Ctrl+N)"
-echo "4. Refresh Expert Advisors"
+echo "4. Right-click 'Expert Advisors' -> Refresh"
 echo "5. Drag 'HFT_OFI_Bot' to chart"
 echo "6. Enable Auto-Trading"
 echo ""
