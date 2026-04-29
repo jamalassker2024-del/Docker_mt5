@@ -1,5 +1,5 @@
 # Force clean build - increment this number to bust cache
-ARG CACHE_BUST=3
+ARG CACHE_BUST=5
 
 FROM python:3.11-slim-bookworm
 
@@ -34,7 +34,7 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. Create MQL5 Bot Code (WITH SAFE EXECUTION FIX)
+# 4. Create MQL5 Bot Code (FULL BOT - KEPT INTACT)
 # ============================================
 RUN cat > /root/OFI_Tick_Bot.mq5 << 'EOF'
 //+------------------------------------------------------------------+
@@ -164,7 +164,6 @@ void OnTick() {
    if(ticksSinceCalc < 1) return;
    ticksSinceCalc = 0;
    
-   // ========== VOLUME-WEIGHTED OFI ==========
    double buyVol = 0, sellVol = 0;
    for(int i = 0; i < LookbackTicks; i++) {
       if(tickBuffer[i].isBuy) {
@@ -176,7 +175,6 @@ void OnTick() {
    
    double ofiRatio = (sellVol == 0) ? 99.0 : buyVol / sellVol;
    
-   // ========== MOMENTUM FILTER ==========
    double lastPrice = tickBuffer[(tickCount-1) % LookbackTicks].price;
    double prevPrice = tickBuffer[(tickCount-2) % LookbackTicks].price;
    bool momentumUp = lastPrice > prevPrice;
@@ -191,7 +189,6 @@ void OnTick() {
    
    if(PositionsTotal() >= MaxConcurrentTrades) return;
    
-   // ========== BUY SIGNAL ==========
    if(ofiRatio >= OFIThreshold && momentumUp) {
       if(dailyTrades >= MaxDailyTrades) return;
       if(TimeCurrent() - lastTradeTime < CooldownSeconds) return;
@@ -202,7 +199,6 @@ void OnTick() {
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       if(ask <= 0) return;
       
-      // ========== SAFE UNIVERSAL EXECUTION FIX ==========
       double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
       double volume = MathMax(LotSize, minLot);
@@ -267,7 +263,6 @@ void OnTick() {
          Print("❌ All filling modes failed for BUY order");
       }
    }
-   // ========== SELL SIGNAL ==========
    else if(ofiRatio <= 1.0 / OFIThreshold && OFIThreshold > 1 && momentumDown) {
       if(dailyTrades >= MaxDailyTrades) return;
       if(TimeCurrent() - lastTradeTime < CooldownSeconds) return;
@@ -358,107 +353,60 @@ void OnDeinit(const int reason) {
 EOF
 
 # ============================================
-# 5. Create Entrypoint Script (FIXED COMPILATION)
+# 5. Create Entrypoint Script (SIMPLIFIED - NO VOLUME TRIGGERS)
 # ============================================
-RUN cat > /entrypoint.sh << 'EOF'
-#!/bin/bash
-
-echo "=========================================="
-echo "HFT OFI BOT - RAILWAY READY"
-echo "=========================================="
-
-rm -f /tmp/.X1-lock
-
-Xvfb :1 -screen 0 1280x800x16 &
-sleep 2
-
-fluxbox &
-x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
-websockify --web=/usr/share/novnc/ 8080 localhost:5900 &
-
-wineboot --init
-sleep 5
-
-MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
-
-if [ ! -f "$MT5_EXE" ]; then
-    echo "Installing MT5..."
-    wine /root/mt5setup.exe /auto /silent &
-    sleep 90
-fi
-
-export DISPLAY=:1
-
-# Start MT5 once to generate folders
-wine "$MT5_EXE" &
-sleep 45
-wineserver -k
-sleep 5
-
-# Find the correct MQL5 folder (search for the Include directory)
-DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "Include" -type d 2>/dev/null | sed 's/\/Include//' | head -n 1)
-
-if [ -z "$DATA_DIR" ]; then
-    echo "Using default Program Files path..."
-    DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
-fi
-
-echo "MQL5 Directory: $DATA_DIR"
-
-# Create Experts folder and copy the bot
-mkdir -p "$DATA_DIR/Experts"
-cp /root/OFI_Tick_Bot.mq5 "$DATA_DIR/Experts/HFT_OFI_Bot.mq5"
-
-# Convert paths to Windows format for MetaEditor
-WIN_MQ5_PATH=$(wine winepath -w "$DATA_DIR/Experts/HFT_OFI_Bot.mq5" 2>/dev/null)
-WIN_INC_PATH=$(wine winepath -w "$DATA_DIR" 2>/dev/null)
-
-echo "Compiling HFT bot..."
-echo "Source: $WIN_MQ5_PATH"
-echo "Include: $WIN_INC_PATH"
-
-# Compile using MetaEditor
-wine "$EDITOR_EXE" /compile:"$WIN_MQ5_PATH" /include:"$WIN_INC_PATH" /log:"/root/compile.log" 2>&1
-
-sleep 5
-
-if [ -f "$DATA_DIR/Experts/HFT_OFI_Bot.ex5" ]; then
-    echo "✅ Bot compiled successfully! .ex5 file created."
-else
-    echo "❌ Compilation failed. Showing log:"
-    cat /root/compile.log 2>/dev/null || echo "No log file found"
-fi
-
-# Restart MT5
-wine "$MT5_EXE" &
-
-# Start bridge
-python3 -m mt5linux --host 0.0.0.0 --port 8001 &
-
-echo "=========================================="
-echo "HFT BOT READY!"
-echo "=========================================="
-echo ""
-echo "SETTINGS:"
-echo "  TP: 3 pips | SL: 2 pips"
-echo "  No cooldown | Max 10 concurrent trades"
-echo "  Volume-weighted OFI | Momentum filter"
-echo ""
-echo "STEPS:"
-echo "1. Open noVNC in browser"
-echo "2. Login to Valetutax"
-echo "3. Open Navigator (Ctrl+N)"
-echo "4. Right-click 'Expert Advisors' -> Refresh"
-echo "5. Drag 'HFT_OFI_Bot' to chart"
-echo "6. Enable Auto-Trading"
-echo ""
-
-tail -f /dev/null
-EOF
+RUN printf '%s\n' \
+'#!/bin/bash' \
+'echo "=========================================="' \
+'echo "HFT OFI BOT - RAILWAY READY"' \
+'echo "=========================================="' \
+'rm -f /tmp/.X1-lock' \
+'Xvfb :1 -screen 0 1280x800x16 &' \
+'sleep 2' \
+'fluxbox &' \
+'x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &' \
+'websockify --web=/usr/share/novnc/ 8080 localhost:5900 &' \
+'wineboot --init' \
+'sleep 5' \
+'MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"' \
+'EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"' \
+'if [ ! -f "$MT5_EXE" ]; then' \
+'    echo "Installing MT5..."' \
+'    wine /root/mt5setup.exe /auto /silent &' \
+'    sleep 90' \
+'fi' \
+'export DISPLAY=:1' \
+'wine "$MT5_EXE" &' \
+'sleep 45' \
+'wineserver -k' \
+'sleep 5' \
+'DATA_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "Include" -type d 2>/dev/null | sed "s/\/Include//" | head -n 1)' \
+'if [ -z "$DATA_DIR" ]; then' \
+'    DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"' \
+'fi' \
+'echo "MQL5 Directory: $DATA_DIR"' \
+'mkdir -p "$DATA_DIR/Experts"' \
+'cp /root/OFI_Tick_Bot.mq5 "$DATA_DIR/Experts/HFT_OFI_Bot.mq5"' \
+'WIN_MQ5_PATH=$(wine winepath -w "$DATA_DIR/Experts/HFT_OFI_Bot.mq5" 2>/dev/null)' \
+'WIN_INC_PATH=$(wine winepath -w "$DATA_DIR" 2>/dev/null)' \
+'echo "Compiling HFT bot..."' \
+'wine "$EDITOR_EXE" /compile:"$WIN_MQ5_PATH" /include:"$WIN_INC_PATH" /log:"/root/compile.log" 2>&1' \
+'sleep 5' \
+'if [ -f "$DATA_DIR/Experts/HFT_OFI_Bot.ex5" ]; then' \
+'    echo "✅ Bot compiled successfully!"' \
+'else' \
+'    echo "❌ Compilation failed. Showing log:"' \
+'    cat /root/compile.log 2>/dev/null || echo "No log file found"' \
+'fi' \
+'wine "$MT5_EXE" &' \
+'python3 -m mt5linux --host 0.0.0.0 --port 8001 &' \
+'echo "=========================================="' \
+'echo "HFT BOT READY!"' \
+'echo "=========================================="' \
+'tail -f /dev/null' > /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
 
 EXPOSE 8080 8001
 
-CMD ["/bin/bash", "/entrypoint.sh"]
+CMD ["/entrypoint.sh"]
