@@ -1,5 +1,5 @@
-# Working VALETAX_PROFIT_MAXIMIZER - FIXED MQL5 PATH
-ARG CACHE_BUST=11
+# Working VALETAX_PROFIT_MAXIMIZER - FIXED noVNC STABILITY
+ARG CACHE_BUST=12
 
 FROM python:3.11-slim-bookworm
 
@@ -87,31 +87,6 @@ int GetSupportedFillingMode(string sym) {
    return ORDER_FILLING_RETURN;
 }
 
-string GetFillingModeName(int mode) {
-   switch(mode) {
-      case ORDER_FILLING_FOK: return "FOK";
-      case ORDER_FILLING_IOC: return "IOC";
-      case ORDER_FILLING_RETURN: return "RETURN";
-      default: return "DEFAULT";
-   }
-}
-
-string GetRetcodeDescription(int code) {
-   switch(code) {
-      case 10004: return "Requote";
-      case 10006: return "Order rejected";
-      case 10007: return "Canceled by dealer";
-      case 10008: return "Order placed";
-      case 10009: return "Done";
-      case 10010: return "Partial fill";
-      case 10011: return "Rejected";
-      case 10012: return "Canceled";
-      case 10013: return "Invalid request";
-      case 10022: return "Unsupported filling mode";
-      default: return "Unknown";
-   }
-}
-
 int OnInit() {
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    peakBalance = initialBalance;
@@ -129,10 +104,8 @@ int OnInit() {
    Print("  Lot Size: ", LotSize);
    
    for(int i = 0; i < ArraySize(Symbols); i++) {
-      int mode = GetSupportedFillingMode(Symbols[i]);
-      cachedFillingMode[i] = mode;
+      cachedFillingMode[i] = GetSupportedFillingMode(Symbols[i]);
       cacheInitialized[i] = true;
-      Print("  ", Symbols[i], ": ", GetFillingModeName(mode));
    }
    Print("========================================");
    return(INIT_SUCCEEDED);
@@ -269,38 +242,19 @@ void OnTimer() {
    if(counter >= 30) {
       double balance = AccountInfoDouble(ACCOUNT_BALANCE);
       double profit = balance - initialBalance;
-      double profitPercent = initialBalance > 0 ? (profit / initialBalance) * 100 : 0;
       Print("========== STATUS ==========");
-      Print(" Balance: $", DoubleToString(balance, 2), " | Profit: $", DoubleToString(profit, 2), " (", DoubleToString(profitPercent, 2), "%)");
-      Print(" Daily: ", dailyTrades, " | Total: ", totalTrades, " | Open: ", CountOpenPositions());
-      Print(" Max DD: ", DoubleToString(maxDrawdown, 2), "%");
-      for(int i = 0; i < ArraySize(Symbols); i++) {
-         double ofi = CalculateOFI(Symbols[i]);
-         string signal = (ofi >= OFI_Threshold) ? "BUY" : ((ofi <= 1.0/OFI_Threshold) ? "SELL" : "");
-         if(signal != "") Print(" ", Symbols[i], ": OFI=", DoubleToString(ofi, 2), "x ", signal);
-      }
+      Print(" Balance: $", DoubleToString(balance, 2), " | Profit: $", DoubleToString(profit, 2));
+      Print(" Daily: ", dailyTrades, " | Total: ", totalTrades);
       Print("============================");
       counter = 0;
    }
 }
 
-void OnDeinit(const int reason) {
-   EventKillTimer();
-   double finalBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double totalProfit = finalBalance - initialBalance;
-   double profitPercent = initialBalance > 0 ? (totalProfit / initialBalance) * 100 : 0;
-   Print("========== BOT SHUTDOWN ==========");
-   Print(" Initial: $", DoubleToString(initialBalance, 2));
-   Print(" Final:   $", DoubleToString(finalBalance, 2));
-   Print(" Profit:  $", DoubleToString(totalProfit, 2), " (", DoubleToString(profitPercent, 2), "%)");
-   Print(" Trades:  ", totalTrades);
-   Print(" Max DD:  ", DoubleToString(maxDrawdown, 2), "%");
-   Print("==================================");
-}
+void OnDeinit(const int reason) { EventKillTimer(); }
 EOF
 
 # ============================================
-# 5. Entrypoint Script - FIXED MQL5 PATH DETECTION
+# 5. Entrypoint Script - FIXED noVNC STABILITY
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -313,15 +267,27 @@ echo "=========================================="
 # Cleanup
 rm -rf /tmp/.X*
 
-# Start X11
-Xvfb :1 -screen 0 1280x800x16 -ac &
+# Start Xvfb with larger buffer and better settings
+Xvfb :1 -screen 0 1280x800x24 -ac -nolisten tcp +extension GLX +extension RANDR &
+sleep 3
+
+# Start fluxbox window manager
+fluxbox -display :1 &
 sleep 2
 
-# Start window manager and VNC
-fluxbox &
-sleep 1
-x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
-websockify --web=/usr/share/novnc 8080 localhost:5900 &
+# Start x11vnc with stability fixes
+# -forever: keep running
+# -shared: allow multiple connections
+# -nopw: no password
+# -cursor: show mouse
+# -repeat: enable key repeat
+# -nowf: disable watchdog (prevents disconnects)
+x11vnc -display :1 -forever -shared -nopw -cursor -repeat -nowf -rfbport 5900 -bg &
+
+# Start websockify with increased timeout and buffer
+# --timeout 0: no timeout
+# --heartbeat 30: keep connection alive
+websockify --web=/usr/share/novnc --timeout 0 --heartbeat 30 8080 localhost:5900 &
 
 # Initialize Wine
 wineboot --init
@@ -340,8 +306,7 @@ echo "Starting MT5..."
 wine "$MT5_EXE" &
 sleep 30
 
-# ========== FIXED MQL5 PATH DETECTION ==========
-# Find the ACTIVE terminal directory (NOT just any MQL5 folder)
+# Find the ACTIVE terminal directory
 TERMINAL_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
 
 if [ -z "$TERMINAL_DIR" ]; then
@@ -351,54 +316,40 @@ fi
 
 DATA_DIR="$TERMINAL_DIR/MQL5"
 echo "Using Terminal Dir: $TERMINAL_DIR"
-echo "Using MQL5 Dir: $DATA_DIR"
 
 # Install EA
 mkdir -p "$DATA_DIR/Experts"
 cp /root/VALETAX_PROFIT_BOT.mq5 "$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5"
 
-# Compile EA (silent mode)
+# Compile EA
 EDITOR_EXE="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 echo "Compiling EA..."
 wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5" /log:"C:\\compile.log" /portable 2>&1
 sleep 5
 
-# VERIFY EX5 EXISTS
 if [ -f "$DATA_DIR/Experts/VALETAX_PROFIT_BOT.ex5" ]; then
-    echo "✅ EA compiled SUCCESSFULLY and is in correct folder"
+    echo "✅ EA compiled SUCCESSFULLY"
 else
     echo "❌ EA NOT FOUND after compile!"
-    echo "Check compile log:"
-    cat "$WINEPREFIX/drive_c/compile.log" 2>/dev/null || echo "No log file"
 fi
 
 # Force refresh Navigator
 sleep 2
-xdotool search --name "MetaTrader" key Ctrl+n 2>/dev/null || true
-sleep 1
 xdotool search --name "MetaTrader" key Ctrl+n 2>/dev/null || true
 
 # Start mt5linux bridge
 echo "Starting mt5linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
-# Auto-refresh charts
-while true; do
-    xdotool search --name "MetaTrader" key F5 2>/dev/null || true
-    sleep 3
-done &
-
 echo "=========================================="
 echo "BOT READY!"
-echo "VNC: http://localhost:8080"
+echo "VNC: http://localhost:8080/vnc.html"
 echo ""
-echo "STEPS:"
-echo "1. Open noVNC in browser"
-echo "2. Login to Valetutax"
-echo "3. Open Navigator (Ctrl+N)"
-echo "4. Refresh Expert Advisors (Right-click->Refresh)"
-echo "5. Drag VALETAX_PROFIT_BOT to chart"
-echo "6. Enable Auto-Trading"
+echo "IMPORTANT - noVNC Stability Tips:"
+echo "1. Use Chrome or Firefox (not Safari)"
+echo "2. Click the gear icon in noVNC"
+echo "3. Disable 'Clipboard'"
+echo "4. Enable 'Resize' -> 'Remote Resizing'"
 echo "=========================================="
 
 tail -f /dev/null
