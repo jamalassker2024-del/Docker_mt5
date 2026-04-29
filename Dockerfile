@@ -1,3 +1,6 @@
+# Force clean build - increment this number to bust cache
+ARG CACHE_BUST=3
+
 FROM python:3.11-slim-bookworm
 
 USER root
@@ -200,7 +203,6 @@ void OnTick() {
       if(ask <= 0) return;
       
       // ========== SAFE UNIVERSAL EXECUTION FIX ==========
-      // Fix 1: Volume validation with minLot and step
       double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
       double volume = MathMax(LotSize, minLot);
@@ -208,7 +210,6 @@ void OnTick() {
          volume = MathFloor(volume / lotStep) * lotStep;
       }
       
-      // Fix 2: Broker stop level check
       int stopLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
       double pip = GetPipValue();
       double minStop = stopLevel * _Point;
@@ -216,7 +217,6 @@ void OnTick() {
       double sl = price - MathMax(StopLossPips * pip, minStop + 2*_Point);
       double tp = price + MathMax(TakeProfitPips * pip, minStop + 2*_Point);
       
-      // Normalize
       int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
       price = NormalizeDouble(price, digits);
       sl = NormalizeDouble(sl, digits);
@@ -225,7 +225,6 @@ void OnTick() {
       Print("SIGNAL -> TRY BUY");
       Print("   Lot=", volume, " Entry=", price, " TP=", tp, " SL=", sl);
       
-      // Fix 3: Try multiple filling modes (IOC, RETURN, FOK)
       int fillings[3] = {ORDER_FILLING_IOC, ORDER_FILLING_RETURN, ORDER_FILLING_FOK};
       bool orderSent = false;
       
@@ -279,7 +278,6 @@ void OnTick() {
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       if(bid <= 0) return;
       
-      // ========== SAFE UNIVERSAL EXECUTION FIX ==========
       double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
       double volume = MathMax(LotSize, minLot);
