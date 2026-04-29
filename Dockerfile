@@ -9,7 +9,7 @@ ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
 # ============================================
-# 1. Install Wine + GUI + Tools
+# 1. Install Wine and Dependencies
 # ============================================
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
@@ -17,222 +17,212 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     novnc websockify wget curl procps cabextract \
     unzip dos2unix \
     libxt6 libxrender1 libxext6 \
+    gettext-base \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ============================================
-# 2. Python deps
+# 2. Install Python deps
 # ============================================
 RUN pip install --no-cache-dir mt5linux rpyc
 
 # ============================================
-# 3. Download MT5
+# 3. Download MT5 Installer
 # ============================================
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. DEBUG BOT (VERY IMPORTANT)
+# 4. BOT (ONLY EXECUTION FIX APPLIED)
 # ============================================
-RUN cat > /root/HFT_DEBUG_BOT.mq5 << 'EOF'
-//+------------------------------------------------------------------+
-//|                  HFT BOT - FULL DEBUG VERSION                    |
-//+------------------------------------------------------------------+
+RUN cat > /root/OFI_Tick_Bot.mq5 << 'EOF'
 #property strict
 
-input double LotSize = 0.01;
-input int TakeProfitPips = 3;
-input int StopLossPips = 2;
-input int MaxSpreadPips = 50;
+input double   LotSize = 0.01;
+input int      OFIThreshold = 2;
+input int      LookbackTicks = 20;
+input int      TakeProfitPips = 3;
+input int      StopLossPips = 2;
+input int      MaxSpreadPips = 2;
+input int      CooldownSeconds = 0;
+input int      MaxDailyTrades = 1000;
+input int      MaxConcurrentTrades = 10;
 
-datetime lastLog=0;
+struct TickData {
+   datetime time;
+   double   price;
+   bool     isBuy;
+   long     volume;
+};
 
-//------------------------------------------------
-double GetPip()
-{
-   return (_Digits==3 || _Digits==5) ? _Point*10 : _Point;
-}
+TickData tickBuffer[];
+int tickCount=0;
+datetime lastTradeTime=0;
+int dailyTrades=0;
+int lastTradeDay=0;
 
-double Spread()
-{
+double GetPipValue(){ return (_Digits==3||_Digits==5)?_Point*10:_Point; }
+
+double GetSpreadPips(){
    double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   if(ask<=0 || bid<=0) return 999;
-   return (ask-bid)/GetPip();
+   if(ask<=0||bid<=0) return 999;
+   return (ask-bid)/GetPipValue();
 }
 
-//------------------------------------------------
-int OnInit()
-{
-   Print("====== DEBUG BOT STARTED ======");
-   Print("Symbol:",_Symbol);
-
-   Print("Terminal Trade Allowed:",TerminalInfoInteger(TERMINAL_TRADE_ALLOWED));
-   Print("Account Trade Allowed:",AccountInfoInteger(ACCOUNT_TRADE_ALLOWED));
-   Print("Symbol Trade Mode:",SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE));
-   Print("Filling Mode:",SymbolInfoInteger(_Symbol,SYMBOL_FILLING_MODE));
-
-   return INIT_SUCCEEDED;
+int GetDay(){
+   MqlDateTime t; TimeToStruct(TimeCurrent(),t); return t.day;
 }
 
-//------------------------------------------------
-void OnTick()
-{
+int OnInit(){
+   ArrayResize(tickBuffer,LookbackTicks);
+   lastTradeDay=GetDay();
+   return(INIT_SUCCEEDED);
+}
+
+void OnTick(){
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
+
+   if(GetDay()!=lastTradeDay){ dailyTrades=0; lastTradeDay=GetDay(); }
+
    MqlTick tick;
+   if(!SymbolInfoTick(_Symbol,tick)) return;
 
-   if(!SymbolInfoTick(_Symbol,tick))
-   {
-      Print("❌ NO TICK DATA");
-      return;
+   bool isBuyTick = tick.last >= tick.ask;
+
+   int i=tickCount%LookbackTicks;
+   tickBuffer[i].price=tick.last;
+   tickBuffer[i].isBuy=isBuyTick;
+   tickBuffer[i].volume=tick.volume;
+   tickCount++;
+
+   if(tickCount<LookbackTicks) return;
+
+   double buyVol=0,sellVol=0;
+   for(int j=0;j<LookbackTicks;j++){
+      if(tickBuffer[j].isBuy) buyVol+=tickBuffer[j].volume;
+      else sellVol+=tickBuffer[j].volume;
    }
 
-   if(tick.ask<=0 || tick.bid<=0)
-   {
-      Print("❌ INVALID PRICES");
-      return;
+   double ofi = (sellVol==0)?99:buyVol/sellVol;
+
+   double last=tickBuffer[(tickCount-1)%LookbackTicks].price;
+   double prev=tickBuffer[(tickCount-2)%LookbackTicks].price;
+
+   bool up = last>prev;
+   bool down = last<prev;
+
+   if(PositionsTotal()>=MaxConcurrentTrades) return;
+
+   double spread=GetSpreadPips();
+   if(spread>MaxSpreadPips) return;
+
+   //================ SAFE EXECUTION =================
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double volume = MathMax(LotSize, minLot);
+   volume = MathFloor(volume / lotStep) * lotStep;
+
+   int stopLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double pip = GetPipValue();
+   double minStop = stopLevel * _Point;
+
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   int fillings[3]={ORDER_FILLING_IOC,ORDER_FILLING_RETURN,ORDER_FILLING_FOK};
+
+   // ================= BUY =================
+   if(ofi>=OFIThreshold && up){
+
+      double price=tick.ask;
+      double sl = price - MathMax(StopLossPips*pip, minStop + 2*_Point);
+      double tp = price + MathMax(TakeProfitPips*pip, minStop + 2*_Point);
+
+      price=NormalizeDouble(price,digits);
+      sl=NormalizeDouble(sl,digits);
+      tp=NormalizeDouble(tp,digits);
+
+      for(int f=0;f<3;f++){
+         MqlTradeRequest req; MqlTradeResult res;
+         ZeroMemory(req); ZeroMemory(res);
+
+         req.action=TRADE_ACTION_DEAL;
+         req.symbol=_Symbol;
+         req.volume=volume;
+         req.type=ORDER_TYPE_BUY;
+         req.price=price;
+         req.sl=sl;
+         req.tp=tp;
+         req.deviation=20;
+         req.magic=777;
+         req.type_filling=fillings[f];
+         req.type_time=ORDER_TIME_GTC;
+
+         Print("Trying BUY filling:",fillings[f]);
+
+         if(!OrderSend(req,res)){
+            Print("Send failed:",GetLastError());
+            continue;
+         }
+
+         Print("Retcode:",res.retcode," ",res.comment);
+
+         if(res.retcode==TRADE_RETCODE_DONE){
+            Print("BUY SUCCESS");
+            break;
+         }
+      }
    }
 
-   double spread=Spread();
+   // ================= SELL =================
+   if(ofi<=1.0/OFIThreshold && down){
 
-   if(TimeCurrent()-lastLog>2)
-   {
-      Print("Tick OK | Bid:",tick.bid," Ask:",tick.ask," Spread:",spread," Positions:",PositionsTotal());
-      lastLog=TimeCurrent();
-   }
+      double price=tick.bid;
+      double sl = price + MathMax(StopLossPips*pip, minStop + 2*_Point);
+      double tp = price - MathMax(TakeProfitPips*pip, minStop + 2*_Point);
 
-   if(spread>MaxSpreadPips)
-   {
-      Print("🚫 SKIP SPREAD:",spread);
-      return;
-   }
+      price=NormalizeDouble(price,digits);
+      sl=NormalizeDouble(sl,digits);
+      tp=NormalizeDouble(tp,digits);
 
-   // 🔥 FORCE SIGNAL (for debugging execution)
-   if(MathRand()%15!=1)
-   {
-      Print("No trade condition...");
-      return;
-   }
+      for(int f=0;f<3;f++){
+         MqlTradeRequest req; MqlTradeResult res;
+         ZeroMemory(req); ZeroMemory(res);
 
-   Print("🔥 SIGNAL -> TRY BUY");
+         req.action=TRADE_ACTION_DEAL;
+         req.symbol=_Symbol;
+         req.volume=volume;
+         req.type=ORDER_TYPE_SELL;
+         req.price=price;
+         req.sl=sl;
+         req.tp=tp;
+         req.deviation=20;
+         req.magic=777;
+         req.type_filling=fillings[f];
+         req.type_time=ORDER_TIME_GTC;
 
-   //--------------------------------------------
-   MqlTradeRequest req;
-   MqlTradeResult res;
+         Print("Trying SELL filling:",fillings[f]);
 
-   ZeroMemory(req);
-   ZeroMemory(res);
+         if(!OrderSend(req,res)){
+            Print("Send failed:",GetLastError());
+            continue;
+         }
 
-   double price=tick.ask;
-   double pip=GetPip();
+         Print("Retcode:",res.retcode," ",res.comment);
 
-   req.action=TRADE_ACTION_DEAL;
-   req.symbol=_Symbol;
-   req.volume=LotSize;
-   req.type=ORDER_TYPE_BUY;
-   req.price=price;
-   req.sl=price-StopLossPips*pip;
-   req.tp=price+TakeProfitPips*pip;
-   req.deviation=20;
-   req.magic=777;
-
-   // 🔥 IMPORTANT FIX
-   req.type_filling=ORDER_FILLING_IOC;
-
-   Print("Sending order...");
-   Print("Price:",price," SL:",req.sl," TP:",req.tp);
-
-   if(!OrderSend(req,res))
-   {
-      Print("❌ OrderSend FAILED (terminal level)");
-      return;
-   }
-
-   Print("==== RESULT ====");
-   Print("Retcode:",res.retcode);
-   Print("Deal:",res.deal);
-   Print("Order:",res.order);
-   Print("Comment:",res.comment);
-
-   if(res.retcode!=TRADE_RETCODE_DONE)
-   {
-      Print("❌ TRADE FAILED CODE:",res.retcode);
-   }
-   else
-   {
-      Print("✅ TRADE SUCCESS");
+         if(res.retcode==TRADE_RETCODE_DONE){
+            Print("SELL SUCCESS");
+            break;
+         }
+      }
    }
 }
 EOF
 
 # ============================================
-# 5. ENTRYPOINT (IMPROVED DEBUG)
+# ENTRYPOINT (UNCHANGED)
 # ============================================
-RUN cat > /entrypoint.sh << 'EOF'
-#!/bin/bash
-
-echo "========= STARTING SYSTEM ========="
-
-rm -f /tmp/.X1-lock
-
-Xvfb :1 -screen 0 1280x800x16 &
-sleep 2
-
-fluxbox &
-x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
-websockify --web=/usr/share/novnc/ 8080 localhost:5900 &
-
-wineboot --init
-sleep 5
-
-MT5="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-EDITOR="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
-
-if [ ! -f "$MT5" ]; then
-    echo "Installing MT5..."
-    wine /root/mt5setup.exe /auto /silent &
-    sleep 90
-fi
-
-export DISPLAY=:1
-
-echo "Launching MT5 first time..."
-wine "$MT5" &
-sleep 40
-wineserver -k
-sleep 5
-
-DATA=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/ -name "Include" | head -n1 | sed 's/\/Include//')
-
-if [ -z "$DATA" ]; then
-   DATA="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
-fi
-
-echo "MQL PATH: $DATA"
-
-mkdir -p "$DATA/Experts"
-cp /root/HFT_DEBUG_BOT.mq5 "$DATA/Experts/HFT_DEBUG_BOT.mq5"
-
-WIN_PATH=$(wine winepath -w "$DATA/Experts/HFT_DEBUG_BOT.mq5")
-
-echo "Compiling..."
-wine "$EDITOR" /compile:"$WIN_PATH" /log:"/root/compile.log"
-
-sleep 5
-
-echo "===== COMPILE LOG ====="
-cat /root/compile.log || true
-
-echo "Starting MT5..."
-wine "$MT5" &
-
-python3 -m mt5linux --host 0.0.0.0 --port 8001 &
-
-echo "========= READY ========="
-echo "Open noVNC -> attach bot manually"
-
-tail -f /dev/null
-EOF
-
+COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
 
 EXPOSE 8080 8001
 
-CMD ["/bin/bash","/entrypoint.sh"]
+CMD ["/bin/bash", "/entrypoint.sh"]
