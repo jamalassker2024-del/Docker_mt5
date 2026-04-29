@@ -1,5 +1,5 @@
-# Working VALETAX_PROFIT_MAXIMIZER - FIXED noVNC STABILITY
-ARG CACHE_BUST=12
+# Working VALETAX_PROFIT_MAXIMIZER - FULLY FIXED
+ARG CACHE_BUST=13
 
 FROM python:3.11-slim-bookworm
 
@@ -102,11 +102,6 @@ int OnInit() {
    Print("  OFI Threshold: ", OFI_Threshold, "x");
    Print("  TP: ", TakeProfit_Points, " pts | SL: ", StopLoss_Points, " pts");
    Print("  Lot Size: ", LotSize);
-   
-   for(int i = 0; i < ArraySize(Symbols); i++) {
-      cachedFillingMode[i] = GetSupportedFillingMode(Symbols[i]);
-      cacheInitialized[i] = true;
-   }
    Print("========================================");
    return(INIT_SUCCEEDED);
 }
@@ -168,11 +163,6 @@ double CalculateOFI(string sym) {
 
 long GetSpread(string sym) { return SymbolInfoInteger(sym, SYMBOL_SPREAD); }
 
-int FindSymbolIndex(string sym) {
-   for(int i = 0; i < ArraySize(Symbols); i++) if(Symbols[i] == sym) return i;
-   return -1;
-}
-
 void ExecuteTrade(string sym, bool isBuy, double ofi) {
    MqlTick t;
    if(!SymbolInfoTick(sym, t)) return;
@@ -182,9 +172,6 @@ void ExecuteTrade(string sym, bool isBuy, double ofi) {
    double price = isBuy ? t.ask : t.bid;
    double sl = isBuy ? price - StopLoss_Points * point : price + StopLoss_Points * point;
    double tp = isBuy ? price + TakeProfit_Points * point : price - TakeProfit_Points * point;
-   
-   int symIndex = FindSymbolIndex(sym);
-   int fillingMode = (symIndex >= 0 && cacheInitialized[symIndex]) ? cachedFillingMode[symIndex] : GetSupportedFillingMode(sym);
    
    MqlTradeRequest req = {};
    MqlTradeResult res = {};
@@ -197,7 +184,7 @@ void ExecuteTrade(string sym, bool isBuy, double ofi) {
    req.tp = NormalizeDouble(tp, digits);
    req.deviation = 150;
    req.magic = MagicNumber;
-   req.type_filling = fillingMode;
+   req.type_filling = ORDER_FILLING_RETURN;
    req.type_time = ORDER_TIME_GTC;
    req.comment = "OFI" + DoubleToString(ofi, 2);
    
@@ -254,7 +241,7 @@ void OnDeinit(const int reason) { EventKillTimer(); }
 EOF
 
 # ============================================
-# 5. Entrypoint Script - FIXED noVNC STABILITY
+# 5. Entrypoint Script - FULLY FIXED
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -267,29 +254,24 @@ echo "=========================================="
 # Cleanup
 rm -rf /tmp/.X*
 
-# Start Xvfb with larger buffer and better settings
-Xvfb :1 -screen 0 1280x800x24 -ac -nolisten tcp +extension GLX +extension RANDR &
+# Start Xvfb
+Xvfb :1 -screen 0 1280x800x24 -ac -nolisten tcp &
 sleep 3
 
-# Start fluxbox window manager
+# Start fluxbox
 fluxbox -display :1 &
 sleep 2
 
-# Start x11vnc with stability fixes
-# -forever: keep running
-# -shared: allow multiple connections
-# -nopw: no password
-# -cursor: show mouse
-# -repeat: enable key repeat
-# -nowf: disable watchdog (prevents disconnects)
-x11vnc -display :1 -forever -shared -nopw -cursor -repeat -nowf -rfbport 5900 -bg &
+# Start x11vnc with stability fixes (prevents crash)
+x11vnc -display :1 -forever -shared -nopw -rfbport 5900 -noxdamage -noxfixes -bg &
+sleep 2
 
-# Start websockify with increased timeout and buffer
-# --timeout 0: no timeout
-# --heartbeat 30: keep connection alive
-websockify --web=/usr/share/novnc --timeout 0 --heartbeat 30 8080 localhost:5900 &
+# Start websockify on all interfaces
+websockify --web=/usr/share/novnc 0.0.0.0:8080 localhost:5900 &
 
 # Initialize Wine
+export WINEDEBUG=-all
+export DISPLAY=:1
 wineboot --init
 sleep 5
 
@@ -298,16 +280,17 @@ MT5_EXE="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 if [ ! -f "$MT5_EXE" ]; then
     echo "Installing MT5..."
     wine /root/mt5setup.exe /auto
-    sleep 90
+    sleep 120
 fi
 
-# Start MT5
+# Start MT5 and wait for full initialization
 echo "Starting MT5..."
 wine "$MT5_EXE" &
-sleep 30
+echo "Waiting for MT5 to fully initialize (60 seconds)..."
+sleep 60
 
-# Find the ACTIVE terminal directory
-TERMINAL_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
+# ========== FIXED: Find REAL terminal directory (exclude Community) ==========
+TERMINAL_DIR=$(find /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal -mindepth 1 -maxdepth 1 -type d ! -name "Community" 2>/dev/null | head -n 1)
 
 if [ -z "$TERMINAL_DIR" ]; then
     echo "ERROR: Terminal directory not found!"
@@ -316,21 +299,29 @@ fi
 
 DATA_DIR="$TERMINAL_DIR/MQL5"
 echo "Using Terminal Dir: $TERMINAL_DIR"
+echo "Using MQL5 Dir: $DATA_DIR"
+
+# Create necessary directories
+mkdir -p "$DATA_DIR/Experts"
+mkdir -p "$DATA_DIR/Logs"
+mkdir -p "$DATA_DIR/Files"
 
 # Install EA
-mkdir -p "$DATA_DIR/Experts"
 cp /root/VALETAX_PROFIT_BOT.mq5 "$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5"
 
-# Compile EA
+# Compile EA (order matters in Wine)
 EDITOR_EXE="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 echo "Compiling EA..."
-wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5" /log:"C:\\compile.log" /portable 2>&1
-sleep 5
+wine "$EDITOR_EXE" /portable /compile:"$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5" /log:"C:\\compile.log"
+sleep 10
 
+# VERIFY EX5 EXISTS
 if [ -f "$DATA_DIR/Experts/VALETAX_PROFIT_BOT.ex5" ]; then
-    echo "✅ EA compiled SUCCESSFULLY"
+    echo "✅ EA compiled SUCCESSFULLY and is in correct folder"
 else
     echo "❌ EA NOT FOUND after compile!"
+    echo "Check compile log:"
+    cat "$WINEPREFIX/drive_c/compile.log" 2>/dev/null || echo "No log file"
 fi
 
 # Force refresh Navigator
@@ -341,15 +332,23 @@ xdotool search --name "MetaTrader" key Ctrl+n 2>/dev/null || true
 echo "Starting mt5linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
+# Auto-refresh charts
+while true; do
+    xdotool search --name "MetaTrader" key F5 2>/dev/null || true
+    sleep 5
+done &
+
 echo "=========================================="
 echo "BOT READY!"
-echo "VNC: http://localhost:8080/vnc.html"
+echo "VNC: https://your-app.up.railway.app:8080/vnc.html"
 echo ""
-echo "IMPORTANT - noVNC Stability Tips:"
-echo "1. Use Chrome or Firefox (not Safari)"
-echo "2. Click the gear icon in noVNC"
-echo "3. Disable 'Clipboard'"
-echo "4. Enable 'Resize' -> 'Remote Resizing'"
+echo "STEPS:"
+echo "1. Open noVNC in browser"
+echo "2. Login to Valetutax"
+echo "3. Open Navigator (Ctrl+N)"
+echo "4. Refresh Expert Advisors (Right-click->Refresh)"
+echo "5. Drag VALETAX_PROFIT_BOT to chart"
+echo "6. Enable Auto-Trading (Alt+T)"
 echo "=========================================="
 
 tail -f /dev/null
