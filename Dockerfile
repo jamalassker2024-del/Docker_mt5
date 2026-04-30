@@ -34,7 +34,7 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. Create TICK-BASED EA (REDESIGNED - NO BARS)
+# 4. Create TICK-BASED EA (FROM WORKING PROFIT MAXIMIZER LOGIC)
 # ============================================
 RUN cat > /root/VALETAX_TICK_BOT.mq5 << 'EOF'
 //+------------------------------------------------------------------+
@@ -45,7 +45,7 @@ RUN cat > /root/VALETAX_TICK_BOT.mq5 << 'EOF'
 #property version "2.00"
 
 // ============================================
-// INPUT PARAMETERS
+// INPUT PARAMETERS (From working Profit Maximizer)
 // ============================================
 input double   LotSize = 0.02;
 input double   OFI_Threshold = 1.30;
@@ -87,6 +87,26 @@ bool     isInitialized = false;
 // Price tracking for direction
 double   lastPrice = 0;
 
+// Cache filling mode per symbol (from working version)
+int cachedFillingMode[6];
+bool cacheInitialized[6];
+
+//+------------------------------------------------------------------+
+//| Get supported filling mode (from working version)                |
+//+------------------------------------------------------------------+
+int GetSupportedFillingMode(string sym) {
+   long fillingFlags = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   
+   if((fillingFlags & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) {
+      return ORDER_FILLING_IOC;
+   }
+   else if((fillingFlags & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) {
+      return ORDER_FILLING_FOK;
+   }
+   
+   return ORDER_FILLING_RETURN;
+}
+
 //+------------------------------------------------------------------+
 //| Get spread in price terms                                        |
 //+------------------------------------------------------------------+
@@ -125,11 +145,19 @@ bool HasPosition() {
 }
 
 //+------------------------------------------------------------------+
-//| Initialization                                                  |
+//| Initialization (with cache from working version)                |
 //+------------------------------------------------------------------+
 int OnInit() {
    initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    lastTradeDay = GetDayOfYear();
+   
+   // Initialize cache for filling modes
+   for(int i = 0; i < ArraySize(Symbols); i++) {
+      int mode = GetSupportedFillingMode(Symbols[i]);
+      cachedFillingMode[i] = mode;
+      cacheInitialized[i] = true;
+   }
+   
    ArrayResize(tickBuffer, LookbackTicks);
    for(int i = 0; i < LookbackTicks; i++) {
       tickBuffer[i].direction = 0;
@@ -238,7 +266,7 @@ void OnTick() {
    // Spread check
    if(GetSpreadPrice() > MaxSpread_Price) return;
    
-   // ========== EXECUTE BUY SIGNAL ==========
+   // ========== EXECUTE BUY SIGNAL (with filling mode from working version) ==========
    if(finalOFI >= OFI_Threshold && momentumUp) {
       double bid, ask;
       GetCurrentPrices(bid, ask);
@@ -250,6 +278,15 @@ void OnTick() {
       double price = ask;
       double sl = price - StopLoss_Price * point;
       double tp = price + TakeProfit_Price * point;
+      
+      // Get cached filling mode
+      int fillingMode = ORDER_FILLING_RETURN;
+      for(int i = 0; i < ArraySize(Symbols); i++) {
+         if(Symbols[i] == _Symbol && cacheInitialized[i]) {
+            fillingMode = cachedFillingMode[i];
+            break;
+         }
+      }
       
       MqlTradeRequest req = {};
       MqlTradeResult res = {};
@@ -264,7 +301,7 @@ void OnTick() {
       req.deviation = 50;
       req.magic = MagicNumber;
       req.comment = "OFI_" + DoubleToString(finalOFI, 1);
-      req.type_filling = ORDER_FILLING_FOK;
+      req.type_filling = fillingMode;
       req.type_time = ORDER_TIME_GTC;
       
       Print("🚀 BUY SIGNAL | OFI=", DoubleToString(finalOFI, 1), "x | Price=", price);
@@ -292,6 +329,15 @@ void OnTick() {
       double sl = price + StopLoss_Price * point;
       double tp = price - TakeProfit_Price * point;
       
+      // Get cached filling mode
+      int fillingMode = ORDER_FILLING_RETURN;
+      for(int i = 0; i < ArraySize(Symbols); i++) {
+         if(Symbols[i] == _Symbol && cacheInitialized[i]) {
+            fillingMode = cachedFillingMode[i];
+            break;
+         }
+      }
+      
       MqlTradeRequest req = {};
       MqlTradeResult res = {};
       
@@ -305,7 +351,7 @@ void OnTick() {
       req.deviation = 50;
       req.magic = MagicNumber;
       req.comment = "OFI_" + DoubleToString(finalOFI, 1);
-      req.type_filling = ORDER_FILLING_FOK;
+      req.type_filling = fillingMode;
       req.type_time = ORDER_TIME_GTC;
       
       Print("🔻 SELL SIGNAL | OFI=", DoubleToString(finalOFI, 1), "x | Price=", price);
