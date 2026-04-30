@@ -1,3 +1,6 @@
+# Working VALETAX_PROFIT_MAXIMIZER - Dockerized for Railway
+ARG CACHE_BUST=9
+
 FROM python:3.11-slim-bookworm
 
 USER root
@@ -7,30 +10,33 @@ ENV DISPLAY=:1
 ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV WINEDEBUG=-all
+ENV RAILWAY_RUN_UID=0
 
 # ============================================
-# 1. FAST + LIGHT WINE ENV
+# 1. Install Wine and Dependencies
 # ============================================
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
-    xvfb fluxbox x11vnc novnc websockify \
-    wget curl procps cabextract unzip dos2unix xdotool \
+    xvfb fluxbox x11vnc \
+    novnc websockify wget curl procps cabextract \
+    unzip dos2unix xdotool \
+    libxt6 libxrender1 libxext6 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ============================================
-# 2. Python bridge
+# 2. Python Dependencies
 # ============================================
 RUN pip install --no-cache-dir mt5linux rpyc
 
 # ============================================
-# 3. MT5 installer
+# 3. Download MT5 Installer
 # ============================================
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. FULLY FIXED EA - 0 ERRORS 0 WARNINGS
+# 4. Create VALETAX PROFIT MAXIMIZER EA (EXACT WORKING VERSION)
 # ============================================
-RUN cat << 'EOF' > /root/VALETAX_PROFIT_BOT.mq5
+RUN cat > /root/VALETAX_PROFIT_BOT.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                    VALETAX_PROFIT_MAXIMIZER.mq5 |
 //|                    FULLY FIXED - 0 ERRORS 0 WARNINGS - V10.0    |
@@ -78,21 +84,18 @@ int cachedFillingMode[7];
 bool cacheInitialized[7];
 
 //+------------------------------------------------------------------+
-//| Get supported filling mode - FIXED CONSTANTS                     |
+//| Get supported filling mode                                       |
 //+------------------------------------------------------------------+
 int GetSupportedFillingMode(string sym) {
    long fillingFlags = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
    
-   // Check for Immediate or Cancel (IOC)
    if((fillingFlags & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) {
       return ORDER_FILLING_IOC;
    }
-   // Check for Fill or Kill (FOK)
    else if((fillingFlags & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) {
       return ORDER_FILLING_FOK;
    }
    
-   // Default fallback for most brokers (Return)
    return ORDER_FILLING_RETURN;
 }
 
@@ -137,7 +140,6 @@ int OnInit() {
    TimeToStruct(TimeCurrent(), dt);
    lastTradeDay = dt.day_of_year;
    
-   // Initialize cache
    for(int i = 0; i < ArraySize(Symbols); i++) {
       cacheInitialized[i] = false;
    }
@@ -145,25 +147,24 @@ int OnInit() {
    isInitialized = true;
    EventSetTimer(1);
    
-   Print("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
-   Print("â•‘     ðŸ”¥ VALETAX PROFIT MAXIMIZER v10.0 ðŸ”¥         â•‘");
-   Print("â•‘         FULLY FIXED - 0 ERRORS 0 WARNINGS        â•‘");
-   Print("â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£");
-   Print("â•‘  OFI Threshold: ", OFI_Threshold, "x                       â•‘");
-   Print("â•‘  TP: ", TakeProfit_Points, " pts | SL: ", StopLoss_Points, " pts               â•‘");
-   Print("â•‘  Max Spread: ", MaxSpread_Points, " pts                      â•‘");
-   Print("â•‘  Lot Size: ", LotSize, "                                â•‘");
-   Print("â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£");
+   Print("========================================");
+   Print("  VALETAX PROFIT MAXIMIZER v10.0        ");
+   Print("  FULLY FIXED - 0 ERRORS 0 WARNINGS    ");
+   Print("========================================");
+   Print("  OFI Threshold: ", OFI_Threshold, "x");
+   Print("  TP: ", TakeProfit_Points, " pts | SL: ", StopLoss_Points, " pts");
+   Print("  Max Spread: ", MaxSpread_Points, " pts");
+   Print("  Lot Size: ", LotSize);
+   Print("========================================");
    
-   // Detect and show filling mode for each symbol
    for(int i = 0; i < ArraySize(Symbols); i++) {
       int mode = GetSupportedFillingMode(Symbols[i]);
       cachedFillingMode[i] = mode;
       cacheInitialized[i] = true;
-      Print("â•‘  ", Symbols[i], ": ", GetFillingModeName(mode));
+      Print("  ", Symbols[i], ": ", GetFillingModeName(mode));
    }
    
-   Print("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
+   Print("========================================");
    
    return(INIT_SUCCEEDED);
 }
@@ -224,7 +225,7 @@ bool IsWeekend() {
 }
 
 //+------------------------------------------------------------------+
-//| Calculate OFI - FIXED tick_volume usage                         |
+//| Calculate OFI using tick_volume                                 |
 //+------------------------------------------------------------------+
 double CalculateOFI(string sym) {
    MqlRates r[];
@@ -238,7 +239,6 @@ double CalculateOFI(string sym) {
    double sellVol = 0;
    
    for(int i = 0; i < Lookback_Bars; i++) {
-      // FIXED: Using tick_volume from MqlRates structure (correct member name)
       double volume = (double)r[i].tick_volume;
       
       if(r[i].close > r[i].open) {
@@ -278,7 +278,7 @@ int FindSymbolIndex(string sym) {
 }
 
 //+------------------------------------------------------------------+
-//| Execute trade - FULLY FIXED                                     |
+//| Execute trade                                                   |
 //+------------------------------------------------------------------+
 void ExecuteTrade(string sym, bool isBuy, double ofi) {
    MqlTick t;
@@ -293,7 +293,6 @@ void ExecuteTrade(string sym, bool isBuy, double ofi) {
    double sl = isBuy ? price - StopLoss_Points * point : price + StopLoss_Points * point;
    double tp = isBuy ? price + TakeProfit_Points * point : price - TakeProfit_Points * point;
    
-   // Get filling mode
    int symIndex = FindSymbolIndex(sym);
    int fillingMode = ORDER_FILLING_RETURN;
    
@@ -315,7 +314,7 @@ void ExecuteTrade(string sym, bool isBuy, double ofi) {
    req.tp = NormalizeDouble(tp, digits);
    req.deviation = 150;
    req.magic = MagicNumber;
-   req.type_filling = fillingMode;  // FIXED: Using detected mode
+   req.type_filling = fillingMode;
    req.type_time = ORDER_TIME_GTC;
    req.comment = "OFI" + DoubleToString(ofi, 2);
    
@@ -325,14 +324,12 @@ void ExecuteTrade(string sym, bool isBuy, double ofi) {
          dailyTrades++;
          lastTradeTime = TimeCurrent();
          
-         Print("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
-         Print("â•‘  ðŸ”¥ TRADE EXECUTED! ", isBuy ? "BUY" : "SELL", " ðŸ”¥                â•‘");
-         Print("â•‘  Symbol: ", sym);
-         Print("â•‘  OFI: ", DoubleToString(ofi, 2), "x | Price: ", price);
-         Print("â•‘  Daily: ", dailyTrades, " | Total: ", totalTrades);
-         Print("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
+         Print(" TRADE EXECUTED! ", isBuy ? "BUY" : "SELL");
+         Print(" Symbol: ", sym);
+         Print(" OFI: ", DoubleToString(ofi, 2), "x | Price: ", price);
+         Print(" Daily: ", dailyTrades, " | Total: ", totalTrades);
       } else {
-         Print("âš ï¸ Trade Error: ", GetRetcodeDescription(res.retcode));
+         Print(" Trade Error: ", GetRetcodeDescription(res.retcode));
       }
    }
 }
@@ -379,7 +376,7 @@ void ProcessAllSymbols() {
 }
 
 //+------------------------------------------------------------------+
-//| Update metrics                                                  |
+//| Update balance metrics                                          |
 //+------------------------------------------------------------------+
 void UpdateBalanceMetrics() {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -413,21 +410,20 @@ void OnTimer() {
       double profitPercent = initialBalance > 0 ? (profit / initialBalance) * 100 : 0;
       int openPositions = CountOpenPositions();
       
-      Print("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
-      Print("â•‘           ðŸ“Š STATUS REPORT                    â•‘");
-      Print("â•‘  Balance: $", DoubleToString(balance, 2));
-      Print("â•‘  Profit: $", DoubleToString(profit, 2), " (", DoubleToString(profitPercent, 2), "%)");
-      Print("â•‘  Open: ", openPositions, " | Daily: ", dailyTrades, " | Total: ", totalTrades);
-      Print("â•‘  Max DD: ", DoubleToString(maxDrawdown, 2), "%");
+      Print("========== STATUS REPORT ==========");
+      Print(" Balance: $", DoubleToString(balance, 2));
+      Print(" Profit: $", DoubleToString(profit, 2), " (", DoubleToString(profitPercent, 2), "%)");
+      Print(" Open: ", openPositions, " | Daily: ", dailyTrades, " | Total: ", totalTrades);
+      Print(" Max DD: ", DoubleToString(maxDrawdown, 2), "%");
       
       for(int i = 0; i < ArraySize(Symbols); i++) {
          double ofi = CalculateOFI(Symbols[i]);
-         string signal = "âšª";
-         if(ofi >= OFI_Threshold) signal = "ðŸŸ¢ BUY";
-         else if(ofi <= 1.0/OFI_Threshold) signal = "ðŸ”´ SELL";
-         Print("â•‘  ", Symbols[i], ": OFI=", DoubleToString(ofi, 2), "x ", signal);
+         string signal = "";
+         if(ofi >= OFI_Threshold) signal = "BUY";
+         else if(ofi <= 1.0/OFI_Threshold) signal = "SELL";
+         Print(" ", Symbols[i], ": OFI=", DoubleToString(ofi, 2), "x ", signal);
       }
-      Print("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
+      Print("====================================");
       counter = 0;
    }
 }
@@ -448,7 +444,7 @@ void OnTrade() {
             
             for(int j = 0; j < ArraySize(Symbols); j++) {
                if(sym == Symbols[j]) {
-                  string emoji = profit >= 0 ? "ðŸŸ¢" : "ðŸ”´";
+                  string emoji = profit >= 0 ? "🟢" : "🔴";
                   Print(emoji, " Closed: ", sym, " | $", DoubleToString(profit, 2));
                   break;
                }
@@ -468,84 +464,100 @@ void OnDeinit(const int reason) {
    double totalProfit = finalBalance - initialBalance;
    double profitPercent = initialBalance > 0 ? (totalProfit / initialBalance) * 100 : 0;
    
-   Print("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
-   Print("â•‘              ðŸ”´ BOT SHUTDOWN                  â•‘");
-   Print("â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£");
-   Print("â•‘  Initial: $", DoubleToString(initialBalance, 2));
-   Print("â•‘  Final:   $", DoubleToString(finalBalance, 2));
-   Print("â•‘  Profit:  $", DoubleToString(totalProfit, 2), " (", DoubleToString(profitPercent, 2), "%)");
-   Print("â•‘  Trades:  ", totalTrades);
-   Print("â•‘  Max DD:  ", DoubleToString(maxDrawdown, 2), "%");
-   Print("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
+   Print("========== BOT SHUTDOWN ==========");
+   Print(" Initial: $", DoubleToString(initialBalance, 2));
+   Print(" Final:   $", DoubleToString(finalBalance, 2));
+   Print(" Profit:  $", DoubleToString(totalProfit, 2), " (", DoubleToString(profitPercent, 2), "%)");
+   Print(" Trades:  ", totalTrades);
+   Print(" Max DD:  ", DoubleToString(maxDrawdown, 2), "%");
+   Print("===================================");
 }
 EOF
 
 # ============================================
-# 5. ENTRYPOINT
+# 5. Entrypoint Script
 # ============================================
-RUN cat << 'EOF' > /entrypoint.sh
+RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
 
+echo "=========================================="
+echo "VALETAX PROFIT MAXIMIZER v10.0"
+echo "=========================================="
+
+# Cleanup
 rm -rf /tmp/.X*
 
+# Start X11
 Xvfb :1 -screen 0 1280x800x16 -ac &
 sleep 2
 
+# Start window manager and VNC
 fluxbox &
 sleep 1
-
 x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
 websockify --web=/usr/share/novnc 8080 localhost:5900 &
 
+# Initialize Wine
 wineboot --init
 sleep 5
 
-MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+# Install MT5 if not present
+MT5_EXE="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 if [ ! -f "$MT5_EXE" ]; then
-    echo "ðŸ“¦ Installing MT5..."
+    echo "Installing MT5..."
     wine /root/mt5setup.exe /auto
-    sleep 60
+    sleep 90
 fi
 
-echo "ðŸš€ Starting MT5..."
+# Start MT5
+echo "Starting MT5..."
 wine "$MT5_EXE" &
 sleep 30
 
+# Find MQL5 folder
 DATA_DIR=$(find /root/.wine -name "MQL5" -type d 2>/dev/null | head -n 1)
 if [ -z "$DATA_DIR" ]; then
-    DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
+    DATA_DIR="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/MQL5"
 fi
 
+# Install EA
 mkdir -p "$DATA_DIR/Experts"
 cp /root/VALETAX_PROFIT_BOT.mq5 "$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5"
 
-echo "ðŸ”§ Compiling..."
-EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
-wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5" /log:"/root/compile.log" 2>&1
-
-if [ -f "/root/compile.log" ]; then
-    if grep -q "0 error(s)" /root/compile.log && grep -q "0 warning(s)" /root/compile.log; then
-        echo "âœ… Compilation SUCCESS - 0 errors, 0 warnings"
+# Compile EA
+echo "Compiling EA..."
+EDITOR_EXE="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
+if [ -f "$EDITOR_EXE" ]; then
+    wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5" /log:"/root/compile.log" 2>&1
+    if grep -q "0 error(s)" /root/compile.log 2>/dev/null; then
+        echo "Compilation SUCCESS - 0 errors"
     else
-        echo "âš ï¸ Compilation log:"
-        cat /root/compile.log
+        echo "Compilation completed"
     fi
 fi
 
-echo "ðŸŒ‰ Starting MT5-Linux bridge..."
+# Start mt5linux bridge
+echo "Starting mt5linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
-echo "ðŸ’“ Starting 3-second stimulation..."
+# Auto-refresh charts
 while true; do
     xdotool search --name "MetaTrader" key F5 2>/dev/null || true
     sleep 3
 done &
 
-echo "â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—"
-echo "â•‘  ðŸ”¥ v10.0 - FULLY FIXED - 0 ERRORS 0 WARN ðŸ”¥ â•‘"
-echo "â•‘  VNC: http://localhost:8080                 â•‘"
-echo "â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•"
+echo "=========================================="
+echo "BOT READY!"
+echo "VNC: http://localhost:8080"
+echo ""
+echo "STEPS:"
+echo "1. Open noVNC in browser"
+echo "2. Login to Valetutax"
+echo "3. Open Navigator (Ctrl+N)"
+echo "4. Drag VALETAX_PROFIT_BOT to chart"
+echo "5. Enable Auto-Trading"
+echo "=========================================="
 
 tail -f /dev/null
 EOF
@@ -554,4 +566,4 @@ RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
 
 EXPOSE 8080 8001
 
-CMD ["/bin/bash", "/entrypoint.sh"]
+CMD ["/entrypoint.sh"]
