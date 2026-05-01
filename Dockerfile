@@ -21,78 +21,104 @@ RUN pip install --no-cache-dir mt5linux rpyc
 # 3. MT5 installer
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# 4. CREATE AGGRESSIVE EA
+# 4. CREATE THE OFI TICK SCALPER
 RUN cat > /root/SimpleBot.mq5 << 'EOF'
-#property copyright "Valetax Bot"
-#property version   "2.00"
+#include <Trade\Trade.mqh>
+
+#property copyright "OFI Aggressive Scalper"
+#property version   "5.00"
 #property strict
 
-input double LotSize = 0.1; // Increased lot size
-input int    Magic   = 12345;
+//--- INPUT PARAMETERS
+input double InpLotSize      = 0.1;      // Trade Volume
+input int    InpOFIThreshold = 50;       // Imbalance threshold to trigger trade
+input int    InpTP           = 15;       // Take Profit (Points)
+input int    InpSL           = 40;       // Stop Loss (Points)
+input int    InpMaxOrders    = 3;        // Max concurrent positions
+input int    InpMagic        = 555001;
 
-// Aggressive Trading Logic: Open Buy if none exists, Open Sell if none exists
-void OnTick() {
-    MqlTick last_tick;
+//--- GLOBALS
+CTrade      trade;
+MqlTick     curr_t, prev_t;
+long        accumulated_ofi = 0;
+bool        first_tick = true;
+
+int OnInit() {
+    trade.SetExpertMagicNumber(InpMagic);
+    // Auto-detect filling mode
+    uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+    if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
+    else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
+    else trade.SetTypeFilling(ORDER_FILLING_RETURN);
     
-    // Fix for "Tick Price: 0.0000" - Only proceed if price is valid
-    if(!SymbolInfoTick(_Symbol, last_tick)) {
-        Print("Waiting for valid tick data...");
+    Print("OFI Scalper Initialized. Threshold: ", InpOFIThreshold);
+    return(INIT_SUCCEEDED);
+}
+
+void OnTick() {
+    if(!SymbolInfoTick(_Symbol, curr_t)) return;
+    if(curr_t.bid <= 0 || curr_t.ask <= 0) return;
+
+    if(first_tick) {
+        prev_t = curr_t;
+        first_tick = false;
         return;
     }
 
-    if(last_tick.ask <= 0 || last_tick.bid <= 0) return;
+    //--- OFI LOGIC (Order Flow Imbalance)
+    // Calculate Delta Bid
+    long delta_bid = 0;
+    if(curr_t.bid > prev_t.bid) delta_bid = (long)curr_t.bid_volume;
+    else if(curr_t.bid < prev_t.bid) delta_bid = -(long)prev_t.bid_volume;
+    else delta_bid = (long)curr_t.bid_volume - (long)prev_t.bid_volume;
 
-    // Check if we already have a position
-    if(PositionSelect(_Symbol) == false) {
-        TradeAction(last_tick);
-    }
-}
+    // Calculate Delta Ask
+    long delta_ask = 0;
+    if(curr_t.ask < prev_t.ask) delta_ask = (long)curr_t.ask_volume;
+    else if(curr_t.ask > prev_t.ask) delta_ask = -(long)prev_t.ask_volume;
+    else delta_ask = (long)curr_t.ask_volume - (long)prev_t.ask_volume;
 
-void TradeAction(MqlTick &tick) {
-    MqlTradeRequest request = {};
-    MqlTradeResult  result  = {};
+    // Net Imbalance for this tick
+    long current_ofi = delta_bid - delta_ask;
+    
+    // Check positions count
+    int total = 0;
+    for(int i=PositionsTotal()-1; i>=0; i--)
+        if(PositionSelectByTicket(PositionGetTicket(i)))
+            if(PositionGetInteger(POSITION_MAGIC)==InpMagic) total++;
 
-    request.action       = TRADE_ACTION_DEAL;
-    request.symbol       = _Symbol;
-    request.volume       = LotSize;
-    request.type_filling = ORDER_FILLING_FOK;
-    request.deviation    = 20;
-    request.magic        = Magic;
-
-    // Aggressive logic: Alternate Buy/Sell or follow trend
-    if(tick.ask > 0) {
-        request.type = ORDER_TYPE_BUY;
-        request.price = tick.ask;
-        if(!OrderSend(request, result)) {
-            Print("OrderSend error: ", GetLastError());
-        } else {
-            Print("Aggressive Buy Opened at: ", tick.ask);
+    //--- ENTRY LOGIC
+    if(total < InpMaxOrders) {
+        // Aggressive Buy on Positive OFI spike
+        if(current_ofi >= InpOFIThreshold) {
+            double sl = curr_t.bid - InpSL * _Point;
+            double tp = curr_t.ask + InpTP * _Point;
+            trade.Buy(InpLotSize, _Symbol, curr_t.ask, sl, tp, "OFI Buy");
+        }
+        // Aggressive Sell on Negative OFI spike
+        else if(current_ofi <= -InpOFIThreshold) {
+            double sl = curr_t.ask + InpSL * _Point;
+            double tp = curr_t.bid - InpTP * _Point;
+            trade.Sell(InpLotSize, _Symbol, curr_t.bid, sl, tp, "OFI Sell");
         }
     }
+
+    prev_t = curr_t;
 }
 EOF
 
-# 5. FIXED INSTALLER (Finds the hashed Data Folder)
+# 5. INSTALLER SCRIPT
 RUN cat > /root/install_ea.sh << 'EOF'
 #!/bin/bash
-echo "Locating MT5 Data Folder..."
-# MT5 creates a hashed folder in AppData. We must find THAT folder.
-DATA_FOLDER=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
-
-if [ -z "$DATA_FOLDER" ]; then
-    echo "MT5 hasn't created the Data Folder yet. Using fallback..."
-    DATA_FOLDER="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
+MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
+if [ -z "$MQL5_DIR" ]; then
+    MQL5_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 fi
-
-echo "Installing EA to: $DATA_FOLDER/Experts/SimpleBot.mq5"
-mkdir -p "$DATA_FOLDER/Experts"
-cp /root/SimpleBot.mq5 "$DATA_FOLDER/Experts/SimpleBot.mq5"
-
+mkdir -p "$MQL5_DIR/Experts"
+cp /root/SimpleBot.mq5 "$MQL5_DIR/Experts/SimpleBot.mq5"
 EDITOR="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
 if [ -f "$EDITOR" ]; then
-    echo "Compiling EA..."
-    wine "$EDITOR" /compile:"$DATA_FOLDER/Experts/SimpleBot.mq5" /log:"/root/compile.log"
-    cat /root/compile.log
+    wine "$EDITOR" /compile:"$MQL5_DIR/Experts/SimpleBot.mq5" /log:"/root/compile.log"
 fi
 EOF
 
@@ -102,30 +128,21 @@ RUN chmod +x /root/install_ea.sh
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
-rm -rf /tmp/.X*
 Xvfb :1 -screen 0 1280x800x16 -ac &
 sleep 2
 fluxbox &
 x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
 websockify --web=/usr/share/novnc 8080 localhost:5900 &
-
 wineboot --init
 sleep 5
-
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 if [ ! -f "$MT5_EXE" ]; then
     wine /root/mt5setup.exe /auto
-    echo "Waiting for installation..."
-    sleep 60
+    sleep 90
 fi
-
-# Start MT5 to let it create the folder structure
 wine "$MT5_EXE" &
 sleep 30
-
-# Run the installer now that folders exist
 bash /root/install_ea.sh
-
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 tail -f /dev/null
 EOF
