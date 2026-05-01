@@ -23,39 +23,44 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 
 # 4. CREATE THE OFI TICK SCALPER
 RUN cat > /root/SimpleBot.mq5 << 'EOF'
+//+------------------------------------------------------------------+
+//|                                           AggressiveOFI_v5.mq5   |
+//|                         Order Flow Imbalance - High Frequency    |
+//+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "OFI Aggressive Scalper"
+#property copyright "Expert Assistant"
 #property version   "5.00"
 #property strict
 
-//--- INPUT PARAMETERS
+//--- INPUTS
 input double InpLotSize      = 0.1;      // Trade Volume
-input int    InpOFIThreshold = 50;       // Imbalance threshold to trigger trade
+input int    InpOFIThreshold = 50;       // Imbalance to trigger (lower = more trades)
 input int    InpTP           = 15;       // Take Profit (Points)
 input int    InpSL           = 40;       // Stop Loss (Points)
-input int    InpMaxOrders    = 3;        // Max concurrent positions
+input int    InpMaxOrders    = 5;        // Concurrent positions for 50+/hr
 input int    InpMagic        = 555001;
 
 //--- GLOBALS
 CTrade      trade;
 MqlTick     curr_t, prev_t;
-long        accumulated_ofi = 0;
 bool        first_tick = true;
 
 int OnInit() {
     trade.SetExpertMagicNumber(InpMagic);
-    // Auto-detect filling mode
+    
+    // Auto-detect Filling Mode
     uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
     if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
     else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
     else trade.SetTypeFilling(ORDER_FILLING_RETURN);
     
-    Print("OFI Scalper Initialized. Threshold: ", InpOFIThreshold);
+    Print("OFI Scalper Online. Threshold: ", InpOFIThreshold);
     return(INIT_SUCCEEDED);
 }
 
 void OnTick() {
+    // Validate Tick and Price
     if(!SymbolInfoTick(_Symbol, curr_t)) return;
     if(curr_t.bid <= 0 || curr_t.ask <= 0) return;
 
@@ -65,44 +70,38 @@ void OnTick() {
         return;
     }
 
-    //--- OFI LOGIC (Order Flow Imbalance)
-    // Calculate Delta Bid
+    //--- OFI CALCULATION
     long delta_bid = 0;
     if(curr_t.bid > prev_t.bid) delta_bid = (long)curr_t.bid_volume;
     else if(curr_t.bid < prev_t.bid) delta_bid = -(long)prev_t.bid_volume;
     else delta_bid = (long)curr_t.bid_volume - (long)prev_t.bid_volume;
 
-    // Calculate Delta Ask
     long delta_ask = 0;
     if(curr_t.ask < prev_t.ask) delta_ask = (long)curr_t.ask_volume;
     else if(curr_t.ask > prev_t.ask) delta_ask = -(long)prev_t.ask_volume;
     else delta_ask = (long)curr_t.ask_volume - (long)prev_t.ask_volume;
 
-    // Net Imbalance for this tick
-    long current_ofi = delta_bid - delta_ask;
+    long ofi = delta_bid - delta_ask;
     
-    // Check positions count
+    // Count current positions
     int total = 0;
     for(int i=PositionsTotal()-1; i>=0; i--)
         if(PositionSelectByTicket(PositionGetTicket(i)))
             if(PositionGetInteger(POSITION_MAGIC)==InpMagic) total++;
 
-    //--- ENTRY LOGIC
+    //--- AGGRESSIVE EXECUTION
     if(total < InpMaxOrders) {
-        // Aggressive Buy on Positive OFI spike
-        if(current_ofi >= InpOFIThreshold) {
+        if(ofi >= InpOFIThreshold) {
             double sl = curr_t.bid - InpSL * _Point;
             double tp = curr_t.ask + InpTP * _Point;
             trade.Buy(InpLotSize, _Symbol, curr_t.ask, sl, tp, "OFI Buy");
         }
-        // Aggressive Sell on Negative OFI spike
-        else if(current_ofi <= -InpOFIThreshold) {
+        else if(ofi <= -InpOFIThreshold) {
             double sl = curr_t.ask + InpSL * _Point;
             double tp = curr_t.bid - InpTP * _Point;
             trade.Sell(InpLotSize, _Symbol, curr_t.bid, sl, tp, "OFI Sell");
         }
     }
-
     prev_t = curr_t;
 }
 EOF
