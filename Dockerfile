@@ -38,7 +38,7 @@ RUN cat > /root/AggressiveOFI_v5.mq5 << 'EOF'
 #property strict
 
 input double InpLotSize      = 0.1;
-input int    InpOFIThreshold = 50;
+input int    InpOFIThreshold = 1;
 input int    InpTP           = 15;
 input int    InpSL           = 40;
 input int    InpMaxOrders    = 5;
