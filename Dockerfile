@@ -18,7 +18,7 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ============================================
-# 2. Python bridge
+# 2. Python bridge + trading libs
 # ============================================
 RUN pip install --no-cache-dir mt5linux rpyc
 
@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. MULTI-PAIR AGGRESSIVE OFI EA
+# 4. MULTI-PAIR AGGRESSIVE OFI EA (preserved)
 # ============================================
 RUN cat > /root/MultiOFI_VX.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
@@ -39,15 +39,14 @@ RUN cat > /root/MultiOFI_VX.mq5 << 'EOF'
 
 //--- INPUTS
 input double InpLotSize      = 0.1;
-input int    InpOFIThreshold = 2;        // Lowered so it actually triggers on CFD volumes
+input int    InpOFIThreshold = 2;
 input int    InpTP           = 15;
 input int    InpSL           = 40;
-input int    InpMaxOrders    = 2;        // Max orders PER SYMBOL
+input int    InpMaxOrders    = 2;
 input int    InpMagic        = 555001;
 
 CTrade trade;
 
-// Structure to track data for each pair separately
 struct SymbolData {
     string name;
     MqlTick prev_t;
@@ -59,64 +58,49 @@ SymbolData symbols[];
 int OnInit() {
     trade.SetExpertMagicNumber(InpMagic);
     
-    // 1. Scan and load all .vx symbols into the array
     int total_symbols = SymbolsTotal(false);
     int count = 0;
-    
     for(int i=0; i<total_symbols; i++) {
         string sym = SymbolName(i, false);
         if(StringFind(sym, ".vx") >= 0) {
-            SymbolSelect(sym, true); // Force into Market Watch
-            ArrayResize(symbols, count + 1);
+            SymbolSelect(sym, true);
+            ArrayResize(symbols, count+1);
             symbols[count].name = sym;
             symbols[count].first_tick = true;
             count++;
         }
     }
-    
-    Print("Loaded ", count, " .vx symbols. Starting 50ms High-Frequency Scanner.");
-    
-    // 2. Start high-frequency timer instead of waiting for OnTick
-    EventSetMillisecondTimer(50); 
+    Print("Loaded ", count, " .vx symbols. Starting 50ms HFT scanner.");
+    EventSetMillisecondTimer(50);
     return(INIT_SUCCEEDED);
 }
 
-void OnDeinit(const int reason) {
-    EventKillTimer();
-}
+void OnDeinit(const int reason) { EventKillTimer(); }
 
 void OnTimer() {
-    // Loop through every .vx symbol and check for OFI triggers
-    for(int i=0; i<ArraySize(symbols); i++) {
-        ProcessSymbol(i);
-    }
+    for(int i=0; i<ArraySize(symbols); i++) ProcessSymbol(i);
 }
 
 void ProcessSymbol(int idx) {
     string sym = symbols[idx].name;
     MqlTick curr_t;
-
     if(!SymbolInfoTick(sym, curr_t)) return;
     if(curr_t.bid <= 0 || curr_t.ask <= 0) return;
-
     if(symbols[idx].first_tick) {
         symbols[idx].prev_t = curr_t;
         symbols[idx].first_tick = false;
         return;
     }
-
-    // Skip if there's no new tick data
     if(curr_t.time_msc == symbols[idx].prev_t.time_msc) return;
 
-    // OFI LOGIC INTACT
     long v = (long)curr_t.volume_real;
     if(v <= 0) v = (long)curr_t.volume;
+    if(v <= 0) v = 1;   // fallback for CFD symbols
 
     long delta_bid = (curr_t.bid > symbols[idx].prev_t.bid) ? v : (curr_t.bid < symbols[idx].prev_t.bid ? -v : 0);
     long delta_ask = (curr_t.ask < symbols[idx].prev_t.ask) ? v : (curr_t.ask > symbols[idx].prev_t.ask ? -v : 0);
     long ofi = delta_bid - delta_ask;
     
-    // Count open positions specifically for THIS symbol
     int total = 0;
     for(int i=PositionsTotal()-1; i>=0; i--) {
         if(PositionSelectByTicket(PositionGetTicket(i))) {
@@ -125,42 +109,34 @@ void ProcessSymbol(int idx) {
             }
         }
     }
-
     if(total < InpMaxOrders && ofi != 0) {
-        // Dynamically set filling mode per symbol
         uint filling = (uint)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
         if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
         else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
         else trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
         double point = SymbolInfoDouble(sym, SYMBOL_POINT);
-
-        // EXECUTE
         if(ofi >= InpOFIThreshold) {
-            trade.Buy(InpLotSize, sym, curr_t.ask, curr_t.bid - InpSL * point, curr_t.ask + InpTP * point, "OFI Buy");
+            trade.Buy(InpLotSize, sym, curr_t.ask, curr_t.bid - InpSL*point, curr_t.ask + InpTP*point, "OFI Buy");
         }
         else if(ofi <= -InpOFIThreshold) {
-            trade.Sell(InpLotSize, sym, curr_t.bid, curr_t.ask + InpSL * point, curr_t.bid - InpTP * point, "OFI Sell");
+            trade.Sell(InpLotSize, sym, curr_t.bid, curr_t.ask + InpSL*point, curr_t.bid - InpTP*point, "OFI Sell");
         }
     }
-    
     symbols[idx].prev_t = curr_t;
 }
 EOF
 
 # ============================================
-# 5. FIXED INSTALL SCRIPT
+# 5. INSTALL SCRIPT (unchanged)
 # ============================================
 RUN cat > /root/install_ea.sh << 'EOF'
 #!/bin/bash
 echo "Locating MT5 Data Folder..."
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
-
 if [ -z "$DATA_DIR" ]; then
-    echo "Hashed folder not found. Falling back to default Program Files..."
     DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 fi
-
 echo "Installing EA to: $DATA_DIR/Experts/"
 mkdir -p "$DATA_DIR/Experts"
 cp /root/MultiOFI_VX.mq5 "$DATA_DIR/Experts/MultiOFI_VX.mq5"
@@ -171,11 +147,124 @@ if [ -f "$EDITOR" ]; then
     wine "$EDITOR" /compile:"$DATA_DIR/Experts/MultiOFI_VX.mq5" /log:"/root/compile.log" 2>&1
 fi
 EOF
-
 RUN chmod +x /root/install_ea.sh
 
 # ============================================
-# 6. ENTRYPOINT
+# 6. PYTHON HFT TRADER (FIX – ACTIVE TRADING)
+# ============================================
+RUN cat > /root/hft_trader.py << 'EOF'
+import sys
+import time
+from collections import defaultdict
+import mt5linux as mt5
+
+def connect_mt5():
+    mt5.initialize()
+    return mt5
+
+def get_all_vx_symbols(mt5):
+    symbols = mt5.symbols_get()
+    if symbols is None:
+        return []
+    return [s.name for s in symbols if '.vx' in s.name]
+
+prev_ticks = {}
+trade_counts = defaultdict(int)
+
+def process_tick(mt5_client, sym, curr_tick, lot_size=0.1, threshold=1, tp=15, sl=40, max_orders_per_sym=2):
+    global prev_ticks, trade_counts
+    if sym not in prev_ticks:
+        prev_ticks[sym] = curr_tick
+        return
+    prev = prev_ticks[sym]
+
+    # Use 1 as volume if symbol provides none (CFD fix)
+    vol = getattr(curr_tick, 'volume', 0)
+    if vol <= 0:
+        vol = 1
+
+    delta_bid = vol if curr_tick.bid > prev.bid else (-vol if curr_tick.bid < prev.bid else 0)
+    delta_ask = vol if curr_tick.ask < prev.ask else (-vol if curr_tick.ask > prev.ask else 0)
+    ofi = delta_bid - delta_ask
+
+    positions = mt5_client.positions_get(symbol=sym)
+    if positions is None:
+        positions = []
+    open_positions = [p for p in positions if p.magic == 555001]
+    if len(open_positions) >= max_orders_per_sym:
+        prev_ticks[sym] = curr_tick
+        return
+
+    point = mt5_client.symbol_info(sym).point
+    if ofi >= threshold:
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": sym,
+            "volume": lot_size,
+            "type": mt5.ORDER_TYPE_BUY,
+            "price": curr_tick.ask,
+            "sl": curr_tick.bid - sl * point,
+            "tp": curr_tick.ask + tp * point,
+            "deviation": 10,
+            "magic": 555001,
+            "comment": "Python OFI Buy",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5_client.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"Buy order placed on {sym} at {curr_tick.ask}")
+        else:
+            print(f"Buy failed on {sym}: {result.comment}")
+    elif ofi <= -threshold:
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": sym,
+            "volume": lot_size,
+            "type": mt5.ORDER_TYPE_SELL,
+            "price": curr_tick.bid,
+            "sl": curr_tick.ask + sl * point,
+            "tp": curr_tick.bid - tp * point,
+            "deviation": 10,
+            "magic": 555001,
+            "comment": "Python OFI Sell",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5_client.order_send(request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"Sell order placed on {sym} at {curr_tick.bid}")
+        else:
+            print(f"Sell failed on {sym}: {result.comment}")
+    prev_ticks[sym] = curr_tick
+
+def main():
+    print("Waiting for MT5 terminal to be ready...")
+    time.sleep(30)
+    mt5_client = connect_mt5()
+    print("Connected to MT5 via mt5linux")
+    symbols = get_all_vx_symbols(mt5_client)
+    if not symbols:
+        print("No .vx symbols found – make sure your broker provides them.")
+        return
+    print(f"Watching {len(symbols)} symbols: {symbols}")
+    for sym in symbols:
+        mt5_client.symbol_select(sym, True)
+
+    # Aggressive 50 ms loop
+    while True:
+        for sym in symbols:
+            tick = mt5_client.symbol_info_tick(sym)
+            if tick and tick.bid > 0 and tick.ask > 0:
+                process_tick(mt5_client, sym, tick)
+        time.sleep(0.05)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# ============================================
+# 7. ENTRYPOINT (starts ALL services)
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -202,6 +291,8 @@ sleep 30
 
 bash /root/install_ea.sh
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
+sleep 5
+python3 /root/hft_trader.py &
 tail -f /dev/null
 EOF
 
