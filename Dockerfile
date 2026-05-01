@@ -8,21 +8,29 @@ ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
-# 1. Install Wine and dependencies
+# ============================================
+# 1. FAST + LIGHT WINE ENV
+# ============================================
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
     xvfb fluxbox x11vnc novnc websockify \
     wget curl procps cabextract unzip dos2unix xdotool \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# ============================================
 # 2. Python bridge
+# ============================================
 RUN pip install --no-cache-dir mt5linux rpyc
 
+# ============================================
 # 3. MT5 installer
+# ============================================
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# 4. CREATE THE OFI TICK SCALPER
-RUN cat > /root/SimpleBot.mq5 << 'EOF'
+# ============================================
+# 4. AGGRESSIVE OFI v5 EA - YOUR STRATEGY
+# ============================================
+RUN cat > /root/AggressiveOFI_v5.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                           AggressiveOFI_v5.mq5   |
 //|                         Order Flow Imbalance - High Frequency    |
@@ -104,48 +112,130 @@ void OnTick() {
     }
     prev_t = curr_t;
 }
+//+------------------------------------------------------------------+
 EOF
 
-# 5. INSTALLER SCRIPT
+# ============================================
+# 5. CREATE INSTALL SCRIPT
+# ============================================
 RUN cat > /root/install_ea.sh << 'EOF'
 #!/bin/bash
-MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
-if [ -z "$MQL5_DIR" ]; then
-    MQL5_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
+
+echo "=========================================="
+echo "Installing AggressiveOFI_v5 EA"
+echo "=========================================="
+
+# Find all MQL5 directories
+MQL5_DIRS=$(find /root/.wine -type d -name "MQL5" 2>/dev/null)
+
+if [ -z "$MQL5_DIRS" ]; then
+    echo "No MQL5 directories found! Creating default..."
+    mkdir -p "/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Experts"
+    cp /root/AggressiveOFI_v5.mq5 "/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Experts/AggressiveOFI_v5.mq5"
+else
+    for dir in $MQL5_DIRS; do
+        echo "Installing to: $dir/Experts/"
+        mkdir -p "$dir/Experts"
+        cp /root/AggressiveOFI_v5.mq5 "$dir/Experts/AggressiveOFI_v5.mq5"
+        
+        # Try to compile with metaeditor if found
+        EDITOR="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
+        if [ -f "$EDITOR" ]; then
+            echo "Compiling in: $dir"
+            wine "$EDITOR" /compile:"$dir/Experts/AggressiveOFI_v5.mq5" /log:"/root/compile.log" 2>&1
+        fi
+    done
 fi
-mkdir -p "$MQL5_DIR/Experts"
-cp /root/SimpleBot.mq5 "$MQL5_DIR/Experts/SimpleBot.mq5"
-EDITOR="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
-if [ -f "$EDITOR" ]; then
-    wine "$EDITOR" /compile:"$MQL5_DIR/Experts/SimpleBot.mq5" /log:"/root/compile.log"
-fi
+
+echo "=========================================="
+echo "EA installation complete!"
+echo "Look for 'AggressiveOFI_v5' in MT5 Navigator"
+echo "=========================================="
 EOF
 
 RUN chmod +x /root/install_ea.sh
 
+# ============================================
 # 6. ENTRYPOINT
+# ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
+
+echo "=========================================="
+echo "AGGRESSIVE OFI v5 - HIGH FREQUENCY"
+echo "=========================================="
+
+# Cleanup
+rm -rf /tmp/.X*
+
+# Start X11
 Xvfb :1 -screen 0 1280x800x16 -ac &
 sleep 2
+
 fluxbox &
+sleep 1
+
 x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
 websockify --web=/usr/share/novnc 8080 localhost:5900 &
+
+# Initialize Wine
 wineboot --init
 sleep 5
+
+# Install MT5 if needed
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 if [ ! -f "$MT5_EXE" ]; then
+    echo "Installing MT5 (first time setup)..."
     wine /root/mt5setup.exe /auto
     sleep 90
 fi
+
+echo "Starting MT5..."
 wine "$MT5_EXE" &
-sleep 30
+sleep 45
+
+# Install the EA
+echo ""
+echo "=========================================="
+echo "INSTALLING EXPERT ADVISOR"
+echo "=========================================="
 bash /root/install_ea.sh
+echo ""
+
+# Start the bridge
+echo "Starting mt5linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
+
+echo ""
+echo "=========================================="
+echo "AGGRESSIVE OFI BOT READY!"
+echo "=========================================="
+echo ""
+echo "STRATEGY SETTINGS:"
+echo "  - Lot Size: 0.1"
+echo "  - OFI Threshold: 50 (lower = more trades)"
+echo "  - TP: 15 points | SL: 40 points"
+echo "  - Max Orders: 5 concurrent"
+echo ""
+echo "TO USE THE BOT:"
+echo "1. Open your browser to the VNC URL"
+echo "2. Login to Valetutax in MT5"
+echo "3. Press Ctrl+N to open Navigator"
+echo "4. Right-click 'Expert Advisors' and select 'Refresh'"
+echo "5. Look for 'AggressiveOFI_v5' in the list"
+echo "6. Drag 'AggressiveOFI_v5' to any chart (BTCUSD.vx, EURUSD, etc.)"
+echo "7. Click 'OK' on the settings dialog"
+echo "8. Click the 'Auto-Trading' button (or press Alt+T)"
+echo ""
+echo "The bot will start trading immediately when OFI threshold is met"
+echo "=========================================="
+
 tail -f /dev/null
 EOF
 
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
+
 EXPOSE 8080 8001
+
 CMD ["/bin/bash", "/entrypoint.sh"]
