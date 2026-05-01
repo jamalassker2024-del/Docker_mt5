@@ -8,32 +8,35 @@ ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
+# 1. Environment Setup
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind \
     xvfb fluxbox x11vnc novnc websockify \
     wget curl procps cabextract unzip dos2unix xdotool \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# 2. Python Bridge
 RUN pip install --no-cache-dir mt5linux rpyc
 
+# 3. MT5 Installer
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# ============================================
-# V8 - THE "ULTRA-SENSITIVE" DOM TRIGGER
-# ============================================
-RUN cat > /root/AggressiveDOM_v8.mq5 << 'EOF'
+# 4. V9 - PROFIT-FOCUSED DOM SNIPER
+RUN cat > /root/AggressiveDOM_v9.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Ultra HFT DOM"
-#property version   "8.00"
+#property copyright "High Win-Rate DOM Sniper"
+#property version   "9.00"
 #property strict
 
+//--- SNIPER INPUTS
 input double InpLotSize      = 0.1;
-input double InpDOMThreshold = 1.01;     // EXTREME: 1% imbalance triggers trade
-input int    InpTP           = 10;       // Tighter for faster exits
+input double InpProfitRatio  = 2.0;      // WIN RATE KEY: Must have 2x more volume on one side
+input int    InpTP           = 10;       // Tight TP for HFT
 input int    InpSL           = 30;
-input int    InpMaxOrders    = 20;       
-input int    InpMagic        = 555008;
+input int    InpMaxOrders    = 10;       
+input int    InpMagic        = 555009;
+input int    InpMaxSpread    = 5;        // PROFITABILITY KEY: Skip if spread is > 5 points
 
 CTrade trade;
 
@@ -43,8 +46,8 @@ int OnInit() {
     for(int i=0; i<total; i++) {
         string sym = SymbolName(i, true);
         if(StringFind(sym, ".vx") >= 0) {
-            if(!MarketBookAdd(sym)) Print("FAILED to subscribe to: ", sym);
-            else Print("Subscribed to DOM: ", sym);
+            MarketBookAdd(sym);
+            Print("Sniper Subscribed to: ", sym);
         }
     }
     return(INIT_SUCCEEDED);
@@ -55,18 +58,16 @@ void OnDeinit(const int reason) {
     for(int i=0; i<total; i++) MarketBookRelease(SymbolName(i, true));
 }
 
-// OnBookEvent is 10x faster than OnTimer for DOM trading
 void OnBookEvent(const string &symbol) {
     if(StringFind(symbol, ".vx") < 0) return;
 
     MqlBookInfo book[];
-    if(!MarketBookGet(symbol, book) || ArraySize(book) == 0) {
-        // Uncomment the line below only for debugging
-        // Print("DEBUG: Book empty for ", symbol);
-        return;
-    }
+    if(!MarketBookGet(symbol, book) || ArraySize(book) < 10) return;
 
     double bids = 0, asks = 0;
+    
+    // Scan only the top 5 levels for immediate impact
+    int scan_depth = MathMin(5, ArraySize(book)/2);
     for(int i=0; i<ArraySize(book); i++) {
         if(book[i].type == BOOK_TYPE_BUY || book[i].type == BOOK_TYPE_BUY_MARKET) bids += (double)book[i].volume;
         if(book[i].type == BOOK_TYPE_SELL || book[i].type == BOOK_TYPE_SELL_MARKET) asks += (double)book[i].volume;
@@ -74,15 +75,21 @@ void OnBookEvent(const string &symbol) {
 
     if(bids == 0 || asks == 0) return;
 
+    // Spread Check for Profitability
+    MqlTick t;
+    SymbolInfoTick(symbol, t);
+    double spread = (t.ask - t.bid) / SymbolInfoDouble(symbol, SYMBOL_POINT);
+    if(spread > InpMaxSpread) return; 
+
+    // Imbalance Calculation
     double buy_ratio = bids / asks;
     double sell_ratio = asks / bids;
 
-    if(buy_ratio >= InpDOMThreshold || sell_ratio >= InpDOMThreshold) {
-        ExecuteHFT(symbol, buy_ratio > sell_ratio);
-    }
+    if(buy_ratio >= InpProfitRatio) ExecuteSniper(symbol, true, t);
+    else if(sell_ratio >= InpProfitRatio) ExecuteSniper(symbol, false, t);
 }
 
-void ExecuteHFT(string sym, bool is_buy) {
+void ExecuteSniper(string sym, bool is_buy, MqlTick &t) {
     int total_pos = 0;
     for(int i=PositionsTotal()-1; i>=0; i--)
         if(PositionSelectByTicket(PositionGetTicket(i)))
@@ -90,28 +97,27 @@ void ExecuteHFT(string sym, bool is_buy) {
 
     if(total_pos >= InpMaxOrders) return;
 
-    MqlTick t;
-    if(!SymbolInfoTick(sym, t)) return;
-    
     double p = SymbolInfoDouble(sym, SYMBOL_POINT);
     uint filling = (uint)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
     trade.SetTypeFilling(((filling & SYMBOL_FILLING_FOK) != 0) ? ORDER_FILLING_FOK : ORDER_FILLING_IOC);
 
-    if(is_buy) trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p, "V8 Buy");
-    else trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p, "V8 Sell");
+    if(is_buy) trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p, "Sniper Buy");
+    else trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p, "Sniper Sell");
 }
 EOF
 
+# 5. Build/Install Logic
 RUN cat > /root/install_ea.sh << 'EOF'
 #!/bin/bash
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
 [ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 mkdir -p "$DATA_DIR/Experts"
-cp /root/AggressiveDOM_v8.mq5 "$DATA_DIR/Experts/AggressiveDOM_v8.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/AggressiveDOM_v8.mq5" /log:"/root/compile.log"
+cp /root/AggressiveDOM_v9.mq5 "$DATA_DIR/Experts/AggressiveDOM_v9.mq5"
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/AggressiveDOM_v9.mq5" /log:"/root/compile.log"
 EOF
 RUN chmod +x /root/install_ea.sh
 
+# 6. Entrypoint
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
