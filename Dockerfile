@@ -7,6 +7,7 @@ ENV DISPLAY=:1
 ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV WINEDEBUG=-all
+ENV QT_X11_NO_MITSHM=1          # Prevents hidden X11 crashes
 
 # ============================================
 # 1. SYSTEM + WINE (FIXED)
@@ -30,7 +31,7 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. EA FILE (FULL CODE)
+# 4. EA FILE (FULL MULTI-PAIR OFI)
 # ============================================
 RUN cat > /root/MultiOFI_VX.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
@@ -129,7 +130,7 @@ void ProcessSymbol(int idx) {
 EOF
 
 # ============================================
-# 5. INSTALL EA SCRIPT (FIXED PATH)
+# 5. INSTALL EA SCRIPT
 # ============================================
 RUN cat > /root/install_ea.sh << 'EOF'
 #!/bin/bash
@@ -152,44 +153,52 @@ EOF
 RUN chmod +x /root/install_ea.sh
 
 # ============================================
-# 6. PYTHON HFT BOT (FIXED)
+# 6. PYTHON HFT BOT (FIXED CONNECTION + RETRIES)
 # ============================================
 RUN cat > /root/hft_trader.py << 'EOF'
 import time
 import mt5linux as mt5
 
 def wait_for_connection():
-    for i in range(20):
-        if mt5.initialize(host="127.0.0.1", port=8001):
-            print("Connected to MT5")
-            return True
-        print("Retrying MT5 connection...")
+    for i in range(60):          # up to 3 minutes retries
+        try:
+            # Try bridge connection
+            if mt5.initialize(host="127.0.0.1", port=8001):
+                print("Connected via RPyC bridge")
+                return True
+            # Fallback direct (rare but possible)
+            if mt5.initialize():
+                print("Connected directly")
+                return True
+        except Exception as e:
+            print(f"Attempt {i+1} failed: {e}")
         time.sleep(3)
     return False
 
-print("Waiting MT5...")
-time.sleep(40)
+print("Waiting MT5 and bridge...")
+time.sleep(60)   # increased from 40 to allow full Wine/MT5 start
 
 if not wait_for_connection():
-    print("FAILED to connect MT5")
+    print("FATAL: Could not connect to MT5")
     exit(1)
 
+# Fetch all .vx symbols
 symbols = [s.name for s in mt5.symbols_get() if ".vx" in s.name]
 
 if not symbols:
-    print("No symbols found")
+    print("No .vx symbols found – check broker login and symbol availability")
     exit(1)
 
 for s in symbols:
     mt5.symbol_select(s, True)
 
-prev = {}
+prev_ticks = {}
 lot = 0.1
 tp = 15
 sl = 40
 magic = 555001
 
-print("HFT STARTED")
+print(f"HFT STARTED – watching {len(symbols)} symbols")
 
 while True:
     for sym in symbols:
@@ -197,19 +206,20 @@ while True:
         if not t or t.bid <= 0 or t.ask <= 0:
             continue
 
-        if sym not in prev:
-            prev[sym] = t
+        if sym not in prev_ticks:
+            prev_ticks[sym] = t
             continue
 
         vol = t.volume if t.volume > 0 else 1
-        delta_bid = vol if t.bid > prev[sym].bid else (-vol if t.bid < prev[sym].bid else 0)
-        delta_ask = vol if t.ask < prev[sym].ask else (-vol if t.ask > prev[sym].ask else 0)
+        delta_bid = vol if t.bid > prev_ticks[sym].bid else (-vol if t.bid < prev_ticks[sym].bid else 0)
+        delta_ask = vol if t.ask < prev_ticks[sym].ask else (-vol if t.ask > prev_ticks[sym].ask else 0)
         ofi = delta_bid - delta_ask
 
         if abs(ofi) >= 1:
-            pos = mt5.positions_get(symbol=sym)
-            open_pos = [p for p in (pos or []) if p.magic == magic]
-            if len(open_pos) < 2:
+            # Count open positions for this symbol with our magic number
+            positions = mt5.positions_get(symbol=sym)
+            open_positions = [p for p in (positions or []) if p.magic == magic]
+            if len(open_positions) < 2:
                 point = mt5.symbol_info(sym).point
                 if ofi > 0:
                     req = {
@@ -228,6 +238,8 @@ while True:
                     res = mt5.order_send(req)
                     if res.retcode == mt5.TRADE_RETCODE_DONE:
                         print(f"Buy {sym} at {t.ask}")
+                    else:
+                        print(f"Buy failed {sym}: {res.comment} (code {res.retcode})")
                 elif ofi < 0:
                     req = {
                         "action": mt5.TRADE_ACTION_DEAL,
@@ -245,14 +257,16 @@ while True:
                     res = mt5.order_send(req)
                     if res.retcode == mt5.TRADE_RETCODE_DONE:
                         print(f"Sell {sym} at {t.bid}")
+                    else:
+                        print(f"Sell failed {sym}: {res.comment} (code {res.retcode})")
 
-        prev[sym] = t
+        prev_ticks[sym] = t
 
-    time.sleep(0.05)
+    time.sleep(0.05)   # 50ms loop – aggressive HFT
 EOF
 
 # ============================================
-# 7. ENTRYPOINT (FIXED ORDER + STABILITY)
+# 7. ENTRYPOINT (FIXED TIMING)
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -281,19 +295,23 @@ fi
 
 echo "Launching MT5..."
 wine "$MT5" &
-sleep 40
+
+echo "Waiting MT5 full startup (Wine needs ~90s)..."
+sleep 90
 
 echo "Installing EA..."
 bash /root/install_ea.sh
 
 echo "Starting mt5linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
-sleep 10
+
+echo "Waiting bridge to become ready..."
+sleep 20
 
 echo "Starting Python trader..."
 python3 /root/hft_trader.py &
 
-echo "System READY"
+echo "System READY – HFT active"
 tail -f /dev/null
 EOF
 
