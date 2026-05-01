@@ -19,89 +19,76 @@ RUN pip install --no-cache-dir mt5linux rpyc
 # 3. MT5 Installer
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# 4. V9.3 - ACTIVE DOM SNIPER
-RUN cat > /root/ActiveSniper_v9_3.mq5 << 'EOF'
+# 4. V9.6 - AGGRESSIVE APEX SCALPER (DOM + VELOCITY HYBRID)
+RUN cat > /root/AggressiveApex_v9_6.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Active DOM Sniper V9.3"
-#property version   "9.30"
+#property copyright "Aggressive Apex V9.6"
+#property version   "9.60"
 #property strict
 
-//--- TUNED INPUTS
-input double InpLotSize      = 0.1;
-input double InpProfitRatio  = 1.7;      // LOWERED from 2.2 to 1.7 for much higher trade frequency
-input int    InpTP           = 10;       
-input int    InpSL           = 25;       
-input int    InpMaxOrders    = 15;       // INCREASED to allow scaling into moves
+//--- AGGRESSION SETTINGS
+input double InpLotSize      = 0.2;      // Doubled for aggressiveness
+input double InpMinVelocity  = 1.5;      // Points moved to trigger "Aggression"
+input int    InpTP           = 8;        // Sniper TP for high win-rate
+input int    InpSL           = 20;       // Tighter SL for profitability
+input int    InpMaxOrders    = 20;       // Extreme aggressiveness
 input int    InpMagic        = 555009;
-input int    InpMaxSpread    = 8;        // LOOSENED from 4 to 8 to allow trading in volatile sessions
 
 CTrade trade;
+double last_tick_price = 0;
 
 int OnInit() {
     trade.SetExpertMagicNumber(InpMagic);
-    trade.LogLevel(LOG_LEVEL_ERRORS); 
-    
     int total = SymbolsTotal(true);
     for(int i=0; i<total; i++) {
         string sym = SymbolName(i, true);
-        if(StringFind(sym, ".vx") >= 0) {
-            MarketBookAdd(sym);
-            Print("Active Sniper watching: ", sym);
-        }
+        if(StringFind(sym, ".vx") >= 0) MarketBookAdd(sym);
     }
     return(INIT_SUCCEEDED);
 }
 
-void OnDeinit(const int reason) {
-    int total = SymbolsTotal(true);
-    for(int i=0; i<total; i++) MarketBookRelease(SymbolName(i, true));
-}
+void OnTick() {
+    string sym = _Symbol;
+    MqlTick t;
+    if(!SymbolInfoTick(sym, t)) return;
 
-void OnBookEvent(const string &symbol) {
+    double p = SymbolInfoDouble(sym, SYMBOL_POINT);
+    if(last_tick_price == 0) { last_tick_price = t.bid; return; }
+
+    // 1. VELOCITY CHECK (How fast is it moving?)
+    double velocity = (t.bid - last_tick_price) / p;
+    last_tick_price = t.bid;
+
+    // 2. VOLUME CHECK (OFI Fallback)
     MqlBookInfo book[];
-    if(!MarketBookGet(symbol, book) || ArraySize(book) < 2) return;
-
-    double bids = 0, asks = 0;
-    // Scanning the whole book but weighting the top levels
-    for(int i=0; i<ArraySize(book); i++) {
-        double vol = (double)book[i].volume;
-        if(book[i].type == BOOK_TYPE_BUY || book[i].type == BOOK_TYPE_BUY_MARKET) bids += vol;
-        if(book[i].type == BOOK_TYPE_SELL || book[i].type == BOOK_TYPE_SELL_MARKET) asks += vol;
+    double ofi_ratio = 1.0;
+    if(MarketBookGet(sym, book) && ArraySize(book) > 0) {
+        double bids=0, asks=0;
+        for(int i=0; i<ArraySize(book); i++) {
+            if(book[i].type <= 2) bids += (double)book[i].volume; else asks += (double)book[i].volume;
+        }
+        if(asks > 0) ofi_ratio = bids/asks;
     }
 
-    if(bids == 0 || asks == 0) return;
-
-    MqlTick t;
-    SymbolInfoTick(symbol, t);
-    double p = SymbolInfoDouble(symbol, SYMBOL_POINT);
-    double spread = (t.ask - t.bid) / p;
-
-    if(spread > InpMaxSpread) return; 
-
-    double buy_ratio = bids / asks;
-    double sell_ratio = asks / bids;
-
-    // Fast Trigger Logic
-    if(buy_ratio >= InpProfitRatio) ExecuteTrade(symbol, true, t, p);
-    else if(sell_ratio >= InpProfitRatio) ExecuteTrade(symbol, false, t, p);
+    // AGGRESSIVE TRIGGER: If velocity > threshold AND flow is in the same direction
+    if(velocity >= InpMinVelocity && ofi_ratio >= 0.8) ExecuteApex(sym, true, t, p);
+    else if(velocity <= -InpMinVelocity && ofi_ratio <= 1.2) ExecuteApex(sym, false, t, p);
 }
 
-void ExecuteTrade(string sym, bool is_buy, MqlTick &t, double p) {
+void ExecuteApex(string sym, bool is_buy, MqlTick &t, double p) {
     int total_pos = 0;
     for(int i=PositionsTotal()-1; i>=0; i--)
-        if(PositionSelectByTicket(PositionGetTicket(i)))
-            if(PositionGetInteger(POSITION_MAGIC) == InpMagic) total_pos++;
+        if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetInteger(POSITION_MAGIC) == InpMagic) total_pos++;
 
     if(total_pos >= InpMaxOrders) return;
 
-    uint filling = (uint)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
-    if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
-    else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
-    else trade.SetTypeFilling(ORDER_FILLING_RETURN);
+    // Fast-Cycle Filling Logic
+    trade.SetTypeFilling((ENUM_ORDER_TYPE_FILLING)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE));
+    if(trade.GetTypeFilling() == 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
 
-    if(is_buy) trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p, "Active Buy");
-    else trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p, "Active Sell");
+    if(is_buy) trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p);
+    else trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p);
 }
 EOF
 
@@ -111,8 +98,8 @@ RUN cat > /root/install_ea.sh << 'EOF'
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
 [ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 mkdir -p "$DATA_DIR/Experts"
-cp /root/ActiveSniper_v9_3.mq5 "$DATA_DIR/Experts/ActiveSniper_v9_3.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/ActiveSniper_v9_3.mq5" /log:"/root/compile.log"
+cp /root/AggressiveApex_v9_6.mq5 "$DATA_DIR/Experts/AggressiveApex_v9_6.mq5"
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/AggressiveApex_v9_6.mq5" /log:"/root/compile.log"
 EOF
 RUN chmod +x /root/install_ea.sh
 
