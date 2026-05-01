@@ -21,35 +21,41 @@ RUN pip install --no-cache-dir mt5linux rpyc
 # 3. MT5 Installer
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# 4. V9 - PROFIT-FOCUSED DOM SNIPER
-RUN cat > /root/AggressiveDOM_v9.mq5 << 'EOF'
+# 4. V9 DEBUG - PROFIT-FOCUSED DOM SNIPER WITH DIAGNOSTICS
+RUN cat > /root/AggressiveDOM_v9_Debug.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "High Win-Rate DOM Sniper"
-#property version   "9.00"
+#property copyright "High Win-Rate DOM Sniper Debug"
+#property version   "9.01"
 #property strict
 
 //--- SNIPER INPUTS
 input double InpLotSize      = 0.1;
-input double InpProfitRatio  = 2.0;      // WIN RATE KEY: Must have 2x more volume on one side
-input int    InpTP           = 10;       // Tight TP for HFT
+input double InpProfitRatio  = 2.0;      
+input int    InpTP           = 10;       
 input int    InpSL           = 30;
 input int    InpMaxOrders    = 10;       
 input int    InpMagic        = 555009;
-input int    InpMaxSpread    = 5;        // PROFITABILITY KEY: Skip if spread is > 5 points
+input int    InpMaxSpread    = 10;       // Increased for easier testing
 
 CTrade trade;
 
 int OnInit() {
     trade.SetExpertMagicNumber(InpMagic);
     int total = SymbolsTotal(true);
+    int count = 0;
     for(int i=0; i<total; i++) {
         string sym = SymbolName(i, true);
         if(StringFind(sym, ".vx") >= 0) {
-            MarketBookAdd(sym);
-            Print("Sniper Subscribed to: ", sym);
+            if(MarketBookAdd(sym)) {
+                Print("DEBUG: Successfully subscribed to DOM for: ", sym);
+                count++;
+            } else {
+                Print("DEBUG: FAILED to subscribe to: ", sym, ". Check if broker supports DOM for this.");
+            }
         }
     }
+    Print("DEBUG: Total .vx symbols monitored: ", count);
     return(INIT_SUCCEEDED);
 }
 
@@ -62,12 +68,18 @@ void OnBookEvent(const string &symbol) {
     if(StringFind(symbol, ".vx") < 0) return;
 
     MqlBookInfo book[];
-    if(!MarketBookGet(symbol, book) || ArraySize(book) < 10) return;
+    // CHECK 1: Is data actually arriving?
+    if(!MarketBookGet(symbol, book)) {
+        // This usually means MarketBookAdd failed or hasn't updated yet
+        return;
+    }
+    
+    if(ArraySize(book) == 0) {
+        Print("DEBUG: ", symbol, " - DOM array is EMPTY. Broker is not sending depth data.");
+        return;
+    }
 
     double bids = 0, asks = 0;
-    
-    // Scan only the top 5 levels for immediate impact
-    int scan_depth = MathMin(5, ArraySize(book)/2);
     for(int i=0; i<ArraySize(book); i++) {
         if(book[i].type == BOOK_TYPE_BUY || book[i].type == BOOK_TYPE_BUY_MARKET) bids += (double)book[i].volume;
         if(book[i].type == BOOK_TYPE_SELL || book[i].type == BOOK_TYPE_SELL_MARKET) asks += (double)book[i].volume;
@@ -75,15 +87,22 @@ void OnBookEvent(const string &symbol) {
 
     if(bids == 0 || asks == 0) return;
 
-    // Spread Check for Profitability
+    // CHECK 2: Spread Check
     MqlTick t;
     SymbolInfoTick(symbol, t);
     double spread = (t.ask - t.bid) / SymbolInfoDouble(symbol, SYMBOL_POINT);
-    if(spread > InpMaxSpread) return; 
-
+    
     // Imbalance Calculation
     double buy_ratio = bids / asks;
     double sell_ratio = asks / bids;
+
+    // CHECK 3: Frequency Log (Only prints once every 100 updates to avoid spam)
+    static int log_limiter = 0;
+    if(log_limiter++ % 500 == 0) {
+        Print("MONITOR [", symbol, "] Spread: ", spread, " | B/A Ratio: ", NormalizeDouble(buy_ratio, 2), " | A/B Ratio: ", NormalizeDouble(sell_ratio, 2));
+    }
+
+    if(spread > InpMaxSpread) return; 
 
     if(buy_ratio >= InpProfitRatio) ExecuteSniper(symbol, true, t);
     else if(sell_ratio >= InpProfitRatio) ExecuteSniper(symbol, false, t);
@@ -97,12 +116,17 @@ void ExecuteSniper(string sym, bool is_buy, MqlTick &t) {
 
     if(total_pos >= InpMaxOrders) return;
 
+    Print(">>> ATTEMPTING TRADE: ", sym, (is_buy ? " BUY" : " SELL"));
+
     double p = SymbolInfoDouble(sym, SYMBOL_POINT);
     uint filling = (uint)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
     trade.SetTypeFilling(((filling & SYMBOL_FILLING_FOK) != 0) ? ORDER_FILLING_FOK : ORDER_FILLING_IOC);
 
-    if(is_buy) trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p, "Sniper Buy");
-    else trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p, "Sniper Sell");
+    bool result;
+    if(is_buy) result = trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p, "Sniper Buy");
+    else result = trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p, "Sniper Sell");
+    
+    if(!result) Print("!!! TRADE FAILED. Error: ", GetLastError());
 }
 EOF
 
@@ -112,8 +136,8 @@ RUN cat > /root/install_ea.sh << 'EOF'
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
 [ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 mkdir -p "$DATA_DIR/Experts"
-cp /root/AggressiveDOM_v9.mq5 "$DATA_DIR/Experts/AggressiveDOM_v9.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/AggressiveDOM_v9.mq5" /log:"/root/compile.log"
+cp /root/AggressiveDOM_v9_Debug.mq5 "$DATA_DIR/Experts/AggressiveDOM_v9_Debug.mq5"
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/AggressiveDOM_v9_Debug.mq5" /log:"/root/compile.log"
 EOF
 RUN chmod +x /root/install_ea.sh
 
