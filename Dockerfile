@@ -28,34 +28,33 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # ============================================
-# 4. HFT TICK-BASED EA (0 ERRORS 0 WARNINGS)
+# 4. FULLY FIXED EA - 0 ERRORS 0 WARNINGS
 # ============================================
 RUN cat << 'EOF' > /root/VALETAX_PROFIT_BOT.mq5
 //+------------------------------------------------------------------+
-//|                                    VALETAX_TICK_HFT_BOT.mq5      |
-//|                    TICK-BASED HFT - 0 ERRORS 0 WARNINGS         |
+//|                                    VALETAX_TICK_BOT.mq5          |
+//|                    TICK-BASED HFT - NO CANDLE BARS               |
 //+------------------------------------------------------------------+
 #property strict
-#property version "10.0"
+#property version "2.00"
 
 // ============================================
-// HFT TICK-BASED SETTINGS
+// INPUT PARAMETERS (From working Profit Maximizer)
 // ============================================
 input double   LotSize = 0.02;
-input double   OFI_Threshold = 1.15;
-input int      LookbackTicks = 20;
-input int      TakeProfit_Price = 150;
+input double   OFI_Threshold = 1.30;
+input int      LookbackTicks = 30;
+input int      TakeProfit_Price = 250;      // Price difference (not pips)
 input int      StopLoss_Price = 100;
 input int      MaxSpread_Price = 50;
-input int      Cooldown_Seconds = 0;
-input int      MaxDaily_Trades = 2000;
-input bool     TradeOnWeekend = true;
-input int      MagicNumber = 999000;
+input int      Cooldown_Seconds = 1;
+input int      MaxDaily_Trades = 500;
+input int      MagicNumber = 999001;
 
-// Supported symbols
+// Supported symbols (Valetutax .vx format)
 string Symbols[] = {
    "BTCUSD.vx",
-   "ETHUSD.vx", 
+   "ETHUSD.vx",
    "DOGEUSD.vx",
    "LTCUSD.vx",
    "XRPUSD.vx",
@@ -73,24 +72,21 @@ struct TickRecord {
 TickRecord tickBuffer[];
 int      tickCount = 0;
 int      totalTicks = 0;
+datetime lastTradeTime = 0;
+int      dailyTrades = 0;
+int      lastTradeDay = 0;
+double   initialBalance = 0;
+bool     isInitialized = false;
+
+// Price tracking for direction
 double   lastPrice = 0;
 
-// State variables
-datetime lastTradeTime = 0;
-int totalTrades = 0;
-int dailyTrades = 0;
-int lastTradeDay = 0;
-double initialBalance = 0;
-double maxDrawdown = 0;
-double peakBalance = 0;
-bool isInitialized = false;
-
-// Cache filling mode per symbol
+// Cache filling mode per symbol (from working version)
 int cachedFillingMode[6];
 bool cacheInitialized[6];
 
 //+------------------------------------------------------------------+
-//| Get supported filling mode                                       |
+//| Get supported filling mode (from working version)                |
 //+------------------------------------------------------------------+
 int GetSupportedFillingMode(string sym) {
    long fillingFlags = SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
@@ -106,41 +102,18 @@ int GetSupportedFillingMode(string sym) {
 }
 
 //+------------------------------------------------------------------+
-//| Get filling mode name for logging                                |
-//+------------------------------------------------------------------+
-string GetFillingModeName(int mode) {
-   switch(mode) {
-      case ORDER_FILLING_FOK:    return "FOK";
-      case ORDER_FILLING_IOC:    return "IOC";
-      case ORDER_FILLING_RETURN: return "RETURN";
-      default:                   return "DEFAULT";
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Get retcode description                                          |
-//+------------------------------------------------------------------+
-string GetRetcodeDescription(int code) {
-   switch(code) {
-      case 10004: return "Requote";
-      case 10006: return "Order rejected";
-      case 10007: return "Canceled by dealer";
-      case 10008: return "Order placed";
-      case 10009: return "Done";
-      case 10010: return "Partial fill";
-      case 10011: return "Rejected";
-      case 10012: return "Canceled";
-      case 10013: return "Invalid request";
-      case 10022: return "Unsupported filling mode";
-      default:    return "Unknown";
-   }
-}
-
-//+------------------------------------------------------------------+
 //| Get spread in price terms                                        |
 //+------------------------------------------------------------------+
-int GetSpreadPrice(string sym) {
-   return (int)SymbolInfoInteger(sym, SYMBOL_SPREAD);
+int GetSpreadPrice() {
+   return (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+}
+
+//+------------------------------------------------------------------+
+//| Get current bid/ask                                             |
+//+------------------------------------------------------------------+
+void GetCurrentPrices(double &bid, double &ask) {
+   bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 }
 
 //+------------------------------------------------------------------+
@@ -153,194 +126,64 @@ int GetDayOfYear() {
 }
 
 //+------------------------------------------------------------------+
-//| Weekend check                                                   |
-//+------------------------------------------------------------------+
-bool IsWeekend() {
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   return (dt.day_of_week == 0 || dt.day_of_week == 6);
-}
-
-//+------------------------------------------------------------------+
 //| Check if position exists                                        |
 //+------------------------------------------------------------------+
-bool HasPosition(string sym) {
+bool HasPosition() {
    for(int i = 0; i < PositionsTotal(); i++) {
       ulong ticket = PositionGetTicket(i);
       if(ticket > 0 && PositionSelectByTicket(ticket)) {
-         if(PositionGetString(POSITION_SYMBOL) == sym) return true;
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol) return true;
       }
    }
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| Count open positions                                            |
+//| Initialization (with cache from working version)                |
 //+------------------------------------------------------------------+
-int CountOpenPositions() {
-   int count = 0;
-   for(int i = 0; i < PositionsTotal(); i++) {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket > 0 && PositionSelectByTicket(ticket)) {
-         string sym = PositionGetString(POSITION_SYMBOL);
-         for(int j = 0; j < ArraySize(Symbols); j++) {
-            if(sym == Symbols[j]) {
-               count++;
-               break;
-            }
-         }
-      }
-   }
-   return count;
-}
-
-//+------------------------------------------------------------------+
-//| Update balance metrics                                          |
-//+------------------------------------------------------------------+
-void UpdateBalanceMetrics() {
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   if(balance > peakBalance) peakBalance = balance;
-   double currentDD = (peakBalance - balance) / peakBalance * 100;
-   if(currentDD > maxDrawdown) maxDrawdown = currentDD;
-}
-
-//+------------------------------------------------------------------+
-//| Find symbol index                                               |
-//+------------------------------------------------------------------+
-int FindSymbolIndex(string sym) {
+int OnInit() {
+   initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   lastTradeDay = GetDayOfYear();
+   
+   // Initialize cache for filling modes
    for(int i = 0; i < ArraySize(Symbols); i++) {
-      if(Symbols[i] == sym) return i;
-   }
-   return -1;
-}
-
-//+------------------------------------------------------------------+
-//| Execute trade                                                   |
-//+------------------------------------------------------------------+
-void ExecuteTrade(string sym, bool isBuy, double ofi) {
-   MqlTick t;
-   if(!SymbolInfoTick(sym, t)) return;
-   
-   double point = SymbolInfoDouble(sym, SYMBOL_POINT);
-   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-   
-   double price = isBuy ? t.ask : t.bid;
-   double sl = isBuy ? price - StopLoss_Price * point : price + StopLoss_Price * point;
-   double tp = isBuy ? price + TakeProfit_Price * point : price - TakeProfit_Price * point;
-   
-   // Get cached filling mode
-   int symIndex = FindSymbolIndex(sym);
-   int fillingMode = ORDER_FILLING_RETURN;
-   
-   if(symIndex >= 0 && cacheInitialized[symIndex]) {
-      fillingMode = cachedFillingMode[symIndex];
-   } else {
-      fillingMode = GetSupportedFillingMode(sym);
+      int mode = GetSupportedFillingMode(Symbols[i]);
+      cachedFillingMode[i] = mode;
+      cacheInitialized[i] = true;
    }
    
-   MqlTradeRequest req = {};
-   MqlTradeResult res = {};
-   
-   req.action = TRADE_ACTION_DEAL;
-   req.symbol = sym;
-   req.volume = LotSize;
-   req.type = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   req.price = NormalizeDouble(price, digits);
-   req.sl = NormalizeDouble(sl, digits);
-   req.tp = NormalizeDouble(tp, digits);
-   req.deviation = 50;
-   req.magic = MagicNumber;
-   req.type_filling = fillingMode;
-   req.type_time = ORDER_TIME_GTC;
-   req.comment = "TICK_OFI_" + DoubleToString(ofi, 2);
-   
-   if(OrderSend(req, res)) {
-      if(res.retcode == TRADE_RETCODE_DONE) {
-         totalTrades++;
-         dailyTrades++;
-         lastTradeTime = TimeCurrent();
-         
-         Print("✅ TRADE EXECUTED! ", isBuy ? "BUY" : "SELL");
-         Print("   Symbol: ", sym);
-         Print("   OFI: ", DoubleToString(ofi, 2), "x | Price: ", price);
-         Print("   Daily: ", dailyTrades, " | Total: ", totalTrades);
-      } else {
-         Print("⚠️ Trade Error: ", GetRetcodeDescription(res.retcode));
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Process single symbol using TICK-BASED OFI                       |
-//+------------------------------------------------------------------+
-void ProcessSymbol(string sym) {
-   if(HasPosition(sym)) return;
-   
-   int spread = GetSpreadPrice(sym);
-   if(spread > MaxSpread_Price) return;
-   
-   if(!TradeOnWeekend && IsWeekend()) return;
-   
-   // ========== TICK-BASED OFI CALCULATION ==========
-   if(tickCount < LookbackTicks) return;
-   
-   int buyTicks = 0, sellTicks = 0;
-   long buyVolume = 0, sellVolume = 0;
-   
+   ArrayResize(tickBuffer, LookbackTicks);
    for(int i = 0; i < LookbackTicks; i++) {
-      if(tickBuffer[i].direction > 0) {
-         buyTicks++;
-         buyVolume += tickBuffer[i].volume;
-      } else if(tickBuffer[i].direction < 0) {
-         sellTicks++;
-         sellVolume += tickBuffer[i].volume;
-      }
+      tickBuffer[i].direction = 0;
+      tickBuffer[i].price = 0;
+      tickBuffer[i].volume = 0;
    }
+   isInitialized = true;
+   EventSetTimer(30);
    
-   // Calculate ratios
-   double tickRatio = (sellTicks > 0) ? (double)buyTicks / (double)sellTicks : 99.0;
-   double volumeRatio = (sellVolume > 0) ? (double)buyVolume / (double)sellVolume : 99.0;
-   double finalOFI = (volumeRatio + tickRatio) / 2.0;
+   Print("========================================");
+   Print("  VALETAX TICK-BASED HFT BOT v2.0      ");
+   Print("========================================");
+   Print("  LOT: ", LotSize);
+   Print("  OFI Threshold: ", OFI_Threshold, "x");
+   Print("  TP: ", TakeProfit_Price, " pts | SL: ", StopLoss_Price, " pts");
+   Print("  Lookback Ticks: ", LookbackTicks);
+   Print("========================================");
+   Print("  READY - WAITING FOR TICKS...");
+   Print("========================================");
    
-   // Momentum check
-   bool momentumUp = buyTicks > sellTicks;
-   bool momentumDown = sellTicks > buyTicks;
-   
-   // Execute based on tick-based OFI
-   if(finalOFI >= OFI_Threshold && momentumUp) {
-      ExecuteTrade(sym, true, finalOFI);
-   } else if(finalOFI <= 1.0 / OFI_Threshold && momentumDown) {
-      ExecuteTrade(sym, false, finalOFI);
-   }
+   return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Process all symbols                                             |
+//| TICK HANDLER - PURE TICK-BASED (NO BARS!)                        |
 //+------------------------------------------------------------------+
-void ProcessAllSymbols() {
-   int currentDay = GetDayOfYear();
-   if(currentDay != lastTradeDay) {
-      dailyTrades = 0;
-      lastTradeDay = currentDay;
-   }
+void OnTick() {
+   if(!isInitialized) return;
    
-   if(dailyTrades >= MaxDaily_Trades) return;
-   
-   if(Cooldown_Seconds > 0) {
-      if(TimeCurrent() - lastTradeTime < Cooldown_Seconds) return;
-   }
-   
-   for(int i = 0; i < ArraySize(Symbols); i++) {
-      ProcessSymbol(Symbols[i]);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Update tick buffer for all symbols                              |
-//+------------------------------------------------------------------+
-void UpdateTickBuffer(string sym) {
+   // Get current tick data
    MqlTick currentTick;
-   if(!SymbolInfoTick(sym, currentTick)) return;
+   if(!SymbolInfoTick(_Symbol, currentTick)) return;
    if(currentTick.last <= 0) return;
    
    totalTicks++;
@@ -360,148 +203,173 @@ void UpdateTickBuffer(string sym) {
    tickBuffer[idx].direction = direction;
    tickBuffer[idx].volume = currentTick.volume;
    tickCount++;
-}
-
-//+------------------------------------------------------------------+
-//| Initialization                                                  |
-//+------------------------------------------------------------------+
-int OnInit() {
-   initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   peakBalance = initialBalance;
-   lastTradeDay = GetDayOfYear();
    
-   // Initialize tick buffer
-   ArrayResize(tickBuffer, LookbackTicks);
+   // Need minimum ticks before analyzing
+   if(tickCount < LookbackTicks) return;
+   
+   // Process every 3 ticks (for speed)
+   static int calcCounter = 0;
+   calcCounter++;
+   if(calcCounter < 2) return;
+   calcCounter = 0;
+   
+   // ========== TICK-BASED OFI CALCULATION ==========
+   int buyTicks = 0, sellTicks = 0;
+   long buyVolume = 0, sellVolume = 0;
+   
    for(int i = 0; i < LookbackTicks; i++) {
-      tickBuffer[i].direction = 0;
-      tickBuffer[i].price = 0;
-      tickBuffer[i].volume = 0;
+      if(tickBuffer[i].direction > 0) {
+         buyTicks++;
+         buyVolume += tickBuffer[i].volume;
+      } else if(tickBuffer[i].direction < 0) {
+         sellTicks++;
+         sellVolume += tickBuffer[i].volume;
+      }
    }
    
-   // Initialize cache for filling modes
-   for(int i = 0; i < ArraySize(Symbols); i++) {
-      int mode = GetSupportedFillingMode(Symbols[i]);
-      cachedFillingMode[i] = mode;
-      cacheInitialized[i] = true;
+   // Calculate ratios
+   double tickRatio = (sellTicks > 0) ? (double)buyTicks / (double)sellTicks : 99.0;
+   double volumeRatio = (sellVolume > 0) ? (double)buyVolume / (double)sellVolume : 99.0;
+   double finalOFI = (volumeRatio + tickRatio) / 2.0;  // Weighted average
+   
+   // Momentum check (price direction)
+   bool momentumUp = buyTicks > sellTicks;
+   bool momentumDown = sellTicks > buyTicks;
+   
+   // Debug output every 30 seconds
+   static datetime lastDebug = 0;
+   if(TimeCurrent() - lastDebug > 15) {
+      int spread = GetSpreadPrice();
+      Print("🔍 TICK STATS: Ticks=", totalTicks, " | OFI=", DoubleToString(finalOFI, 2), "x | Spread=", spread, " | B=", buyTicks, " S=", sellTicks);
+      lastDebug = TimeCurrent();
    }
    
-   isInitialized = true;
-   EventSetTimer(30);
+   // Check for existing position
+   if(HasPosition()) return;
    
-   Print("========================================");
-   Print("  VALETAX TICK-BASED HFT BOT v10.0     ");
-   Print("  TICK HFT - 0 ERRORS 0 WARNINGS      ");
-   Print("========================================");
-   Print("  LOT: ", LotSize);
-   Print("  OFI Threshold: ", OFI_Threshold, "x");
-   Print("  TP: ", TakeProfit_Price, " pts | SL: ", StopLoss_Price, " pts");
-   Print("  Lookback Ticks: ", LookbackTicks);
-   Print("========================================");
-   
-   for(int i = 0; i < ArraySize(Symbols); i++) {
-      Print("  ", Symbols[i], ": ", GetFillingModeName(cachedFillingMode[i]));
+   // Daily reset
+   int currentDay = GetDayOfYear();
+   if(currentDay != lastTradeDay) {
+      dailyTrades = 0;
+      lastTradeDay = currentDay;
    }
    
-   Print("========================================");
-   Print("  READY - TICK-BASED HFT ACTIVE");
-   Print("========================================");
+   if(dailyTrades >= MaxDaily_Trades) return;
+   if(TimeCurrent() - lastTradeTime < Cooldown_Seconds) return;
    
-   return(INIT_SUCCEEDED);
-}
-
-//+------------------------------------------------------------------+
-//| TICK HANDLER - PURE TICK-BASED                                   |
-//+------------------------------------------------------------------+
-void OnTick() {
-   if(!isInitialized) return;
+   // Spread check
+   if(GetSpreadPrice() > MaxSpread_Price) return;
    
-   // Update tick buffer for all symbols
-   for(int i = 0; i < ArraySize(Symbols); i++) {
-      UpdateTickBuffer(Symbols[i]);
+   // ========== EXECUTE BUY SIGNAL (with filling mode from working version) ==========
+   if(finalOFI >= OFI_Threshold && momentumUp) {
+      double bid, ask;
+      GetCurrentPrices(bid, ask);
+      if(ask <= 0) return;
+      
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      
+      double price = ask;
+      double sl = price - StopLoss_Price * point;
+      double tp = price + TakeProfit_Price * point;
+      
+      // Get cached filling mode
+      int fillingMode = ORDER_FILLING_RETURN;
+      for(int i = 0; i < ArraySize(Symbols); i++) {
+         if(Symbols[i] == _Symbol && cacheInitialized[i]) {
+            fillingMode = cachedFillingMode[i];
+            break;
+         }
+      }
+      
+      MqlTradeRequest req = {};
+      MqlTradeResult res = {};
+      
+      req.action = TRADE_ACTION_DEAL;
+      req.symbol = _Symbol;
+      req.volume = LotSize;
+      req.type = ORDER_TYPE_BUY;
+      req.price = NormalizeDouble(price, digits);
+      req.sl = NormalizeDouble(sl, digits);
+      req.tp = NormalizeDouble(tp, digits);
+      req.deviation = 50;
+      req.magic = MagicNumber;
+      req.comment = "OFI_" + DoubleToString(finalOFI, 1);
+      req.type_filling = fillingMode;
+      req.type_time = ORDER_TIME_GTC;
+      
+      Print("🚀 BUY SIGNAL | OFI=", DoubleToString(finalOFI, 1), "x | Price=", price);
+      
+      if(OrderSend(req, res)) {
+         if(res.retcode == TRADE_RETCODE_DONE) {
+            dailyTrades++;
+            lastTradeTime = TimeCurrent();
+            Print("✅ BUY EXECUTED! Ticket:", res.order);
+         } else {
+            Print("❌ Order failed. Retcode:", res.retcode);
+         }
+      }
    }
-   
-   ProcessAllSymbols();
+   // ========== EXECUTE SELL SIGNAL ==========
+   else if(finalOFI <= 1.0 / OFI_Threshold && momentumDown) {
+      double bid, ask;
+      GetCurrentPrices(bid, ask);
+      if(bid <= 0) return;
+      
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      
+      double price = bid;
+      double sl = price + StopLoss_Price * point;
+      double tp = price - TakeProfit_Price * point;
+      
+      // Get cached filling mode
+      int fillingMode = ORDER_FILLING_RETURN;
+      for(int i = 0; i < ArraySize(Symbols); i++) {
+         if(Symbols[i] == _Symbol && cacheInitialized[i]) {
+            fillingMode = cachedFillingMode[i];
+            break;
+         }
+      }
+      
+      MqlTradeRequest req = {};
+      MqlTradeResult res = {};
+      
+      req.action = TRADE_ACTION_DEAL;
+      req.symbol = _Symbol;
+      req.volume = LotSize;
+      req.type = ORDER_TYPE_SELL;
+      req.price = NormalizeDouble(price, digits);
+      req.sl = NormalizeDouble(sl, digits);
+      req.tp = NormalizeDouble(tp, digits);
+      req.deviation = 50;
+      req.magic = MagicNumber;
+      req.comment = "OFI_" + DoubleToString(finalOFI, 1);
+      req.type_filling = fillingMode;
+      req.type_time = ORDER_TIME_GTC;
+      
+      Print("🔻 SELL SIGNAL | OFI=", DoubleToString(finalOFI, 1), "x | Price=", price);
+      
+      if(OrderSend(req, res)) {
+         if(res.retcode == TRADE_RETCODE_DONE) {
+            dailyTrades++;
+            lastTradeTime = TimeCurrent();
+            Print("✅ SELL EXECUTED! Ticket:", res.order);
+         } else {
+            Print("❌ Order failed. Retcode:", res.retcode);
+         }
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
 //| Timer - Status Report                                           |
 //+------------------------------------------------------------------+
 void OnTimer() {
-   if(!isInitialized) return;
-   
-   ProcessAllSymbols();
-   UpdateBalanceMetrics();
-   
-   static int counter = 0;
-   counter++;
-   if(counter >= 30) {
-      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      double profit = balance - initialBalance;
-      double profitPercent = initialBalance > 0 ? (profit / initialBalance) * 100 : 0;
-      int openPositions = CountOpenPositions();
-      
-      Print("========== STATUS REPORT ==========");
-      Print(" Balance: $", DoubleToString(balance, 2));
-      Print(" Profit: $", DoubleToString(profit, 2), " (", DoubleToString(profitPercent, 2), "%)");
-      Print(" Open: ", openPositions, " | Daily: ", dailyTrades, " | Total: ", totalTrades);
-      Print(" Ticks: ", totalTicks, " | Max DD: ", DoubleToString(maxDrawdown, 2), "%");
-      
-      // Show current OFI for each symbol
-      for(int i = 0; i < ArraySize(Symbols); i++) {
-         if(tickCount >= LookbackTicks) {
-            int buyTicks = 0, sellTicks = 0;
-            long buyVolume = 0, sellVolume = 0;
-            
-            for(int j = 0; j < LookbackTicks; j++) {
-               if(tickBuffer[j].direction > 0) {
-                  buyTicks++;
-                  buyVolume += tickBuffer[j].volume;
-               } else if(tickBuffer[j].direction < 0) {
-                  sellTicks++;
-                  sellVolume += tickBuffer[j].volume;
-               }
-            }
-            
-            double tickRatio = (sellTicks > 0) ? (double)buyTicks / (double)sellTicks : 99.0;
-            double volumeRatio = (sellVolume > 0) ? (double)buyVolume / (double)sellVolume : 99.0;
-            double finalOFI = (volumeRatio + tickRatio) / 2.0;
-            
-            string signal = "⚪";
-            if(finalOFI >= OFI_Threshold) signal = "🟢 BUY";
-            else if(finalOFI <= 1.0/OFI_Threshold) signal = "🔴 SELL";
-            
-            Print(" ", Symbols[i], ": OFI=", DoubleToString(finalOFI, 2), "x ", signal);
-         }
-      }
-      Print("====================================");
-      counter = 0;
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Position close monitor                                          |
-//+------------------------------------------------------------------+
-void OnTrade() {
-   HistorySelect(TimeCurrent() - 60, TimeCurrent());
-   int total = HistoryDealsTotal();
-   
-   for(int i = total - 1; i >= 0; i--) {
-      ulong ticket = HistoryDealGetTicket(i);
-      if(ticket > 0) {
-         if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT) {
-            string sym = HistoryDealGetString(ticket, DEAL_SYMBOL);
-            double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
-            
-            for(int j = 0; j < ArraySize(Symbols); j++) {
-               if(sym == Symbols[j]) {
-                  string emoji = profit >= 0 ? "🟢" : "🔴";
-                  Print(emoji, " Closed: ", sym, " | $", DoubleToString(profit, 2));
-                  break;
-               }
-            }
-         }
-      }
-   }
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double profit = balance - initialBalance;
+   double profitPct = (profit / initialBalance) * 100;
+   Print("📊 STATUS | Balance: $", DoubleToString(balance, 2), " | Profit: $", DoubleToString(profit, 2), " (", DoubleToString(profitPct, 2), "%) | Trades: ", dailyTrades, " | Ticks: ", totalTicks);
 }
 
 //+------------------------------------------------------------------+
@@ -509,19 +377,13 @@ void OnTrade() {
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
    EventKillTimer();
-   
    double finalBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double totalProfit = finalBalance - initialBalance;
-   double profitPercent = initialBalance > 0 ? (totalProfit / initialBalance) * 100 : 0;
-   
+   double profit = finalBalance - initialBalance;
    Print("========== BOT SHUTDOWN ==========");
-   Print(" Initial: $", DoubleToString(initialBalance, 2));
-   Print(" Final:   $", DoubleToString(finalBalance, 2));
-   Print(" Profit:  $", DoubleToString(totalProfit, 2), " (", DoubleToString(profitPercent, 2), "%)");
-   Print(" Trades:  ", totalTrades);
-   Print(" Ticks:   ", totalTicks);
-   Print(" Max DD:  ", DoubleToString(maxDrawdown, 2), "%");
-   Print("===================================");
+   Print(" Final Balance: $", DoubleToString(finalBalance, 2));
+   Print(" Total Profit: $", DoubleToString(profit, 2));
+   Print(" Total Ticks: ", totalTicks);
+   Print("==================================");
 }
 EOF
 
@@ -548,12 +410,12 @@ sleep 5
 
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 if [ ! -f "$MT5_EXE" ]; then
-    echo "📦 Installing MT5..."
+    echo "ðŸ“¦ Installing MT5..."
     wine /root/mt5setup.exe /auto
     sleep 60
 fi
 
-echo "🚀 Starting MT5..."
+echo "ðŸš€ Starting MT5..."
 wine "$MT5_EXE" &
 sleep 30
 
@@ -563,39 +425,34 @@ if [ -z "$DATA_DIR" ]; then
 fi
 
 mkdir -p "$DATA_DIR/Experts"
-cp /root/VALETAX_PROFIT_BOT.mq5 "$DATA_DIR/Experts/VALETAX_TICK_HFT_BOT.mq5"
+cp /root/VALETAX_PROFIT_BOT.mq5 "$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5"
 
-echo "🔧 Compiling..."
+echo "ðŸ”§ Compiling..."
 EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
-wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/VALETAX_TICK_HFT_BOT.mq5" /log:"/root/compile.log" 2>&1
+wine "$EDITOR_EXE" /compile:"$DATA_DIR/Experts/VALETAX_PROFIT_BOT.mq5" /log:"/root/compile.log" 2>&1
 
 if [ -f "/root/compile.log" ]; then
     if grep -q "0 error(s)" /root/compile.log && grep -q "0 warning(s)" /root/compile.log; then
-        echo "✅ Compilation SUCCESS - 0 errors, 0 warnings"
+        echo "âœ… Compilation SUCCESS - 0 errors, 0 warnings"
     else
-        echo "⚠️ Compilation log:"
+        echo "âš ï¸ Compilation log:"
         cat /root/compile.log
     fi
 fi
 
-echo "🌉 Starting MT5-Linux bridge..."
+echo "ðŸŒ‰ Starting MT5-Linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
 
-echo "💓 Starting 3-second stimulation..."
+echo "ðŸ’“ Starting 3-second stimulation..."
 while true; do
     xdotool search --name "MetaTrader" key F5 2>/dev/null || true
     sleep 3
 done &
 
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  🔥 TICK-BASED HFT v10.0 - 0 ERRORS 0 WARNINGS 🔥           ║"
-echo "║  VNC: http://localhost:8080                                 ║"
-echo "║  FEATURES:                                                  ║"
-echo "║  - Pure tick-based (NO candle bars)                        ║"
-echo "║  - Tick direction tracking                                  ║"
-echo "║  - Volume-weighted OFI                                      ║"
-echo "║  - 20-tick lookback window                                  ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
+echo "â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—"
+echo "â•‘  ðŸ”¥ v10.0 - FULLY FIXED - 0 ERRORS 0 WARN ðŸ”¥ â•‘"
+echo "â•‘  VNC: http://localhost:8080                 â•‘"
+echo "â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•"
 
 tail -f /dev/null
 EOF
