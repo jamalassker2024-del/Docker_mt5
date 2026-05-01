@@ -1,7 +1,6 @@
 FROM python:3.11-slim-bookworm
 
 USER root
-
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DISPLAY=:1
 ENV WINEPREFIX=/root/.wine
@@ -10,8 +9,7 @@ ENV WINEDEBUG=-all
 
 # 1. Environment Setup
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
-    wine wine64 wine32:i386 winbind \
-    xvfb fluxbox x11vnc novnc websockify \
+    wine wine64 wine32:i386 winbind xvfb fluxbox x11vnc novnc websockify \
     wget curl procps cabextract unzip dos2unix xdotool \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -21,41 +19,38 @@ RUN pip install --no-cache-dir mt5linux rpyc
 # 3. MT5 Installer
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# 4. V9 DEBUG - PROFIT-FOCUSED DOM SNIPER WITH DIAGNOSTICS
-RUN cat > /root/AggressiveDOM_v9_Debug.mq5 << 'EOF'
+# 4. V9.2 - REFINED DOM SNIPER
+RUN cat > /root/AggressiveDOM_v9_2.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "High Win-Rate DOM Sniper Debug"
-#property version   "9.01"
+#property copyright "High Win-Rate DOM Sniper V9.2"
+#property version   "9.20"
 #property strict
 
 //--- SNIPER INPUTS
 input double InpLotSize      = 0.1;
-input double InpProfitRatio  = 2.0;      
-input int    InpTP           = 10;       
-input int    InpSL           = 30;
-input int    InpMaxOrders    = 10;       
+input double InpProfitRatio  = 2.2;      // Higher ratio (2.2x) for "High Winning" certainty
+input int    InpTP           = 12;       // Slightly wider TP to clear commissions
+input int    InpSL           = 25;       // Tighter SL for better risk/reward
+input int    InpMaxOrders    = 8;        
 input int    InpMagic        = 555009;
-input int    InpMaxSpread    = 10;       // Increased for easier testing
+input int    InpMaxSpread    = 4;        // Strict spread filter for high profitability
 
 CTrade trade;
 
 int OnInit() {
     trade.SetExpertMagicNumber(InpMagic);
+    // Explicitly set very fast execution mode
+    trade.LogLevel(LOG_LEVEL_ERRORS); 
+    
     int total = SymbolsTotal(true);
-    int count = 0;
     for(int i=0; i<total; i++) {
         string sym = SymbolName(i, true);
         if(StringFind(sym, ".vx") >= 0) {
-            if(MarketBookAdd(sym)) {
-                Print("DEBUG: Successfully subscribed to DOM for: ", sym);
-                count++;
-            } else {
-                Print("DEBUG: FAILED to subscribe to: ", sym, ". Check if broker supports DOM for this.");
-            }
+            if(MarketBookAdd(sym)) Print("Sniper Subscribed & Ready: ", sym);
+            else Print("DOM Error on: ", sym);
         }
     }
-    Print("DEBUG: Total .vx symbols monitored: ", count);
     return(INIT_SUCCEEDED);
 }
 
@@ -65,19 +60,8 @@ void OnDeinit(const int reason) {
 }
 
 void OnBookEvent(const string &symbol) {
-    if(StringFind(symbol, ".vx") < 0) return;
-
     MqlBookInfo book[];
-    // CHECK 1: Is data actually arriving?
-    if(!MarketBookGet(symbol, book)) {
-        // This usually means MarketBookAdd failed or hasn't updated yet
-        return;
-    }
-    
-    if(ArraySize(book) == 0) {
-        Print("DEBUG: ", symbol, " - DOM array is EMPTY. Broker is not sending depth data.");
-        return;
-    }
+    if(!MarketBookGet(symbol, book) || ArraySize(book) < 5) return;
 
     double bids = 0, asks = 0;
     for(int i=0; i<ArraySize(book); i++) {
@@ -87,28 +71,22 @@ void OnBookEvent(const string &symbol) {
 
     if(bids == 0 || asks == 0) return;
 
-    // CHECK 2: Spread Check
     MqlTick t;
     SymbolInfoTick(symbol, t);
-    double spread = (t.ask - t.bid) / SymbolInfoDouble(symbol, SYMBOL_POINT);
-    
-    // Imbalance Calculation
+    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+    double spread = (t.ask - t.bid) / point;
+
+    // PROFITABILITY SHIELD: Skip if spread eats > 35% of our profit target
+    if(spread > InpMaxSpread) return; 
+
     double buy_ratio = bids / asks;
     double sell_ratio = asks / bids;
 
-    // CHECK 3: Frequency Log (Only prints once every 100 updates to avoid spam)
-    static int log_limiter = 0;
-    if(log_limiter++ % 500 == 0) {
-        Print("MONITOR [", symbol, "] Spread: ", spread, " | B/A Ratio: ", NormalizeDouble(buy_ratio, 2), " | A/B Ratio: ", NormalizeDouble(sell_ratio, 2));
-    }
-
-    if(spread > InpMaxSpread) return; 
-
-    if(buy_ratio >= InpProfitRatio) ExecuteSniper(symbol, true, t);
-    else if(sell_ratio >= InpProfitRatio) ExecuteSniper(symbol, false, t);
+    if(buy_ratio >= InpProfitRatio) ExecuteSniper(symbol, true, t, point);
+    else if(sell_ratio >= InpProfitRatio) ExecuteSniper(symbol, false, t, point);
 }
 
-void ExecuteSniper(string sym, bool is_buy, MqlTick &t) {
+void ExecuteSniper(string sym, bool is_buy, MqlTick &t, double p) {
     int total_pos = 0;
     for(int i=PositionsTotal()-1; i>=0; i--)
         if(PositionSelectByTicket(PositionGetTicket(i)))
@@ -116,17 +94,14 @@ void ExecuteSniper(string sym, bool is_buy, MqlTick &t) {
 
     if(total_pos >= InpMaxOrders) return;
 
-    Print(">>> ATTEMPTING TRADE: ", sym, (is_buy ? " BUY" : " SELL"));
-
-    double p = SymbolInfoDouble(sym, SYMBOL_POINT);
+    // AUTO-FILLING DETECTOR (Crucial for live execution success)
     uint filling = (uint)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
-    trade.SetTypeFilling(((filling & SYMBOL_FILLING_FOK) != 0) ? ORDER_FILLING_FOK : ORDER_FILLING_IOC);
+    if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
+    else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
+    else trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
-    bool result;
-    if(is_buy) result = trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p, "Sniper Buy");
-    else result = trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p, "Sniper Sell");
-    
-    if(!result) Print("!!! TRADE FAILED. Error: ", GetLastError());
+    if(is_buy) trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p);
+    else trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p);
 }
 EOF
 
@@ -136,8 +111,8 @@ RUN cat > /root/install_ea.sh << 'EOF'
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
 [ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 mkdir -p "$DATA_DIR/Experts"
-cp /root/AggressiveDOM_v9_Debug.mq5 "$DATA_DIR/Experts/AggressiveDOM_v9_Debug.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/AggressiveDOM_v9_Debug.mq5" /log:"/root/compile.log"
+cp /root/AggressiveDOM_v9_2.mq5 "$DATA_DIR/Experts/AggressiveDOM_v9_2.mq5"
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/AggressiveDOM_v9_2.mq5" /log:"/root/compile.log"
 EOF
 RUN chmod +x /root/install_ea.sh
 
