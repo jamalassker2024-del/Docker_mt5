@@ -150,7 +150,7 @@ EOF
 RUN chmod +x /root/install_ea.sh
 
 # ============================================
-# 6. PYTHON HFT TRADER (FIX – ACTIVE TRADING)
+# 6. FIXED PYTHON HFT TRADER (corrected connection)
 # ============================================
 RUN cat > /root/hft_trader.py << 'EOF'
 import sys
@@ -158,106 +158,125 @@ import time
 from collections import defaultdict
 import mt5linux as mt5
 
-def connect_mt5():
-    mt5.initialize()
-    return mt5
+def connect_mt5(retries=10, delay=5):
+    """Connect to the mt5linux RPyC service."""
+    for i in range(retries):
+        try:
+            # Initialize with the correct host/port of the RPyC server
+            if mt5.initialize(host='127.0.0.1', port=8001):
+                print("Connected to MT5 via mt5linux")
+                return True
+        except Exception as e:
+            print(f"Connection attempt {i+1} failed: {e}")
+        time.sleep(delay)
+    return False
 
-def get_all_vx_symbols(mt5):
-    symbols = mt5.symbols_get()
+def get_all_vx_symbols(mt5_client):
+    symbols = mt5_client.symbols_get()
     if symbols is None:
         return []
     return [s.name for s in symbols if '.vx' in s.name]
 
-prev_ticks = {}
-trade_counts = defaultdict(int)
-
-def process_tick(mt5_client, sym, curr_tick, lot_size=0.1, threshold=1, tp=15, sl=40, max_orders_per_sym=2):
-    global prev_ticks, trade_counts
-    if sym not in prev_ticks:
-        prev_ticks[sym] = curr_tick
-        return
-    prev = prev_ticks[sym]
-
-    # Use 1 as volume if symbol provides none (CFD fix)
-    vol = getattr(curr_tick, 'volume', 0)
-    if vol <= 0:
-        vol = 1
-
-    delta_bid = vol if curr_tick.bid > prev.bid else (-vol if curr_tick.bid < prev.bid else 0)
-    delta_ask = vol if curr_tick.ask < prev.ask else (-vol if curr_tick.ask > prev.ask else 0)
-    ofi = delta_bid - delta_ask
-
-    positions = mt5_client.positions_get(symbol=sym)
-    if positions is None:
-        positions = []
-    open_positions = [p for p in positions if p.magic == 555001]
-    if len(open_positions) >= max_orders_per_sym:
-        prev_ticks[sym] = curr_tick
-        return
-
-    point = mt5_client.symbol_info(sym).point
-    if ofi >= threshold:
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": sym,
-            "volume": lot_size,
-            "type": mt5.ORDER_TYPE_BUY,
-            "price": curr_tick.ask,
-            "sl": curr_tick.bid - sl * point,
-            "tp": curr_tick.ask + tp * point,
-            "deviation": 10,
-            "magic": 555001,
-            "comment": "Python OFI Buy",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        result = mt5_client.order_send(request)
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"Buy order placed on {sym} at {curr_tick.ask}")
-        else:
-            print(f"Buy failed on {sym}: {result.comment}")
-    elif ofi <= -threshold:
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": sym,
-            "volume": lot_size,
-            "type": mt5.ORDER_TYPE_SELL,
-            "price": curr_tick.bid,
-            "sl": curr_tick.ask + sl * point,
-            "tp": curr_tick.bid - tp * point,
-            "deviation": 10,
-            "magic": 555001,
-            "comment": "Python OFI Sell",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        result = mt5_client.order_send(request)
-        if result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"Sell order placed on {sym} at {curr_tick.bid}")
-        else:
-            print(f"Sell failed on {sym}: {result.comment}")
-    prev_ticks[sym] = curr_tick
-
 def main():
-    print("Waiting for MT5 terminal to be ready...")
-    time.sleep(30)
-    mt5_client = connect_mt5()
-    print("Connected to MT5 via mt5linux")
-    symbols = get_all_vx_symbols(mt5_client)
+    print("Waiting for MT5 terminal and RPyC server...")
+    time.sleep(30)  # give MT5 time to fully start
+
+    if not connect_mt5():
+        print("FATAL: Could not connect to mt5linux RPyC server")
+        sys.exit(1)
+
+    symbols = get_all_vx_symbols(mt5)
     if not symbols:
-        print("No .vx symbols found – make sure your broker provides them.")
-        return
+        print("No .vx symbols found – ensure your broker provides them and you are logged in.")
+        sys.exit(1)
+
     print(f"Watching {len(symbols)} symbols: {symbols}")
     for sym in symbols:
-        mt5_client.symbol_select(sym, True)
+        mt5.symbol_select(sym, True)
 
-    # Aggressive 50 ms loop
+    prev_ticks = {}
+    lot_size = 0.1
+    threshold = 1      # aggressive: trigger on smallest OFI
+    tp_points = 15
+    sl_points = 40
+    max_orders_per_sym = 2
+
+    print("Starting aggressive HFT loop (50ms)...")
     while True:
         for sym in symbols:
-            tick = mt5_client.symbol_info_tick(sym)
-            if tick and tick.bid > 0 and tick.ask > 0:
-                process_tick(mt5_client, sym, tick)
-        time.sleep(0.05)
+            tick = mt5.symbol_info_tick(sym)
+            if not tick or tick.bid <= 0 or tick.ask <= 0:
+                continue
+
+            # First tick for this symbol – just store
+            if sym not in prev_ticks:
+                prev_ticks[sym] = tick
+                continue
+
+            prev = prev_ticks[sym]
+            # Use 1 as volume if real volume is missing (CFD fix)
+            vol = getattr(tick, 'volume', 0)
+            if vol <= 0:
+                vol = 1
+
+            delta_bid = vol if tick.bid > prev.bid else (-vol if tick.bid < prev.bid else 0)
+            delta_ask = vol if tick.ask < prev.ask else (-vol if tick.ask > prev.ask else 0)
+            ofi = delta_bid - delta_ask
+
+            # Count open positions for this symbol with our magic number
+            positions = mt5.positions_get(symbol=sym)
+            if positions is None:
+                positions = []
+            open_positions = [p for p in positions if p.magic == 555001]
+            if len(open_positions) >= max_orders_per_sym:
+                prev_ticks[sym] = tick
+                continue
+
+            point = mt5.symbol_info(sym).point
+            if ofi >= threshold:
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": sym,
+                    "volume": lot_size,
+                    "type": mt5.ORDER_TYPE_BUY,
+                    "price": tick.ask,
+                    "sl": tick.bid - sl_points * point,
+                    "tp": tick.ask + tp_points * point,
+                    "deviation": 10,
+                    "magic": 555001,
+                    "comment": "Python OFI Buy",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+                result = mt5.order_send(request)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    print(f"Buy order placed on {sym} at {tick.ask}")
+                else:
+                    print(f"Buy failed on {sym}: {result.comment} (retcode={result.retcode})")
+            elif ofi <= -threshold:
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": sym,
+                    "volume": lot_size,
+                    "type": mt5.ORDER_TYPE_SELL,
+                    "price": tick.bid,
+                    "sl": tick.ask + sl_points * point,
+                    "tp": tick.bid - tp_points * point,
+                    "deviation": 10,
+                    "magic": 555001,
+                    "comment": "Python OFI Sell",
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                }
+                result = mt5.order_send(request)
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    print(f"Sell order placed on {sym} at {tick.bid}")
+                else:
+                    print(f"Sell failed on {sym}: {result.comment} (retcode={result.retcode})")
+
+            prev_ticks[sym] = tick
+
+        time.sleep(0.05)  # 50ms loop
 
 if __name__ == "__main__":
     main()
@@ -291,7 +310,7 @@ sleep 30
 
 bash /root/install_ea.sh
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
-sleep 5
+sleep 5    # give the RPyC server time to start
 python3 /root/hft_trader.py &
 tail -f /dev/null
 EOF
