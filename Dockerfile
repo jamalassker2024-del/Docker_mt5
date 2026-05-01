@@ -19,80 +19,112 @@ RUN pip install --no-cache-dir mt5linux rpyc
 # 3. MT5 Installer
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# 4. V9.7 - "TOTAL WAR" AGGRESSIVE SNIPER
-RUN cat > /root/AggressiveSniper_v9_7.mq5 << 'EOF'
+# 4. V10.0 - THE PULSE SNIPER (Timer-Based Aggressive OFI)
+RUN cat > /root/PulseSniper_v10.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Aggressive Sniper V9.7"
-#property version   "9.70"
+#property copyright "Pulse Sniper V10.0"
+#property version   "10.00"
 #property strict
 
-//--- MAXIMUM AGGRESSION INPUTS
-input double InpLotSize      = 0.3;      // High stake
-input int    InpVolumeBurst  = 50;       // Minimum volume spike to trigger
-input int    InpTP           = 7;        // Ultra-tight TP for 90%+ win rate
-input int    InpSL           = 25;       
-input int    InpMaxOrders    = 30;       // Extreme frequency
-input int    InpMagic        = 555009;
+//--- AGGRESSIVE INPUTS
+input double InpLotSize      = 0.2;      // Aggressive Lot Size
+input int    InpOFIThreshold = 1;        // Trigger on any directional imbalance
+input int    InpTP           = 12;       // Target profit in points
+input int    InpSL           = 30;       // Stop loss in points
+input int    InpMaxOrders    = 15;       // High frequency cap
+input int    InpMagic        = 555010;
 
-CTrade trade;
+struct SymbolState {
+    string name;
+    MqlTick prev_t;
+    bool first;
+};
+
+CTrade      trade;
+SymbolState monitored_symbols[];
 
 int OnInit() {
     trade.SetExpertMagicNumber(InpMagic);
     int total = SymbolsTotal(true);
+    int count = 0;
+    
     for(int i=0; i<total; i++) {
         string sym = SymbolName(i, true);
-        if(StringFind(sym, ".vx") >= 0) MarketBookAdd(sym);
+        if(StringFind(sym, ".vx") >= 0) {
+            ArrayResize(monitored_symbols, count + 1);
+            monitored_symbols[count].name = sym;
+            monitored_symbols[count].first = true;
+            count++;
+        }
     }
+    
+    Print("Pulse Sniper V10 active. Monitoring ", count, " symbols.");
+    EventSetMillisecondTimer(50); // 20 updates per second
     return(INIT_SUCCEEDED);
 }
 
-void OnBookEvent(const string &symbol) {
-    MqlBookInfo book[];
-    if(!MarketBookGet(symbol, book) || ArraySize(book) < 2) return;
+void OnDeinit(const int reason) { EventKillTimer(); }
 
-    double bids = 0, asks = 0;
-    for(int i=0; i<ArraySize(book); i++) {
-        if(book[i].type == BOOK_TYPE_BUY || book[i].type == BOOK_TYPE_BUY_MARKET) bids += (double)book[i].volume;
-        if(book[i].type == BOOK_TYPE_SELL || book[i].type == BOOK_TYPE_SELL_MARKET) asks += (double)book[i].volume;
+void OnTimer() {
+    for(int i=0; i<ArraySize(monitored_symbols); i++) {
+        ProcessPulse(monitored_symbols[i]);
     }
-
-    // Trigger only on massive volume imbalances (The "Profit Spike")
-    if(bids > asks + InpVolumeBurst) ExecuteFast(symbol, true);
-    else if(asks > bids + InpVolumeBurst) ExecuteFast(symbol, false);
 }
 
-void ExecuteFast(string sym, bool is_buy) {
+void ProcessPulse(SymbolState &state) {
+    MqlTick curr_t;
+    if(!SymbolInfoTick(state.name, curr_t)) return;
+    if(curr_t.bid <= 0 || curr_t.ask <= 0) return;
+
+    if(state.first) {
+        state.prev_t = curr_t;
+        state.first = false;
+        return;
+    }
+
+    if(curr_t.time_msc == state.prev_t.time_msc) return;
+
+    // VOLUME DELTA CALCULATION
+    long v = (curr_t.volume_real > 0) ? (long)curr_t.volume_real : (long)curr_t.volume;
+    long delta_bid = (curr_t.bid > state.prev_t.bid) ? v : (curr_t.bid < state.prev_t.bid ? -v : 0);
+    long delta_ask = (curr_t.ask < state.prev_t.ask) ? v : (curr_t.ask > state.prev_t.ask ? -v : 0);
+    long ofi = delta_bid - delta_ask;
+
     int total_pos = 0;
-    for(int i=PositionsTotal()-1; i>=0; i--)
-        if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetInteger(POSITION_MAGIC) == InpMagic) total_pos++;
+    for(int j=PositionsTotal()-1; j>=0; j--)
+        if(PositionSelectByTicket(PositionGetTicket(j)))
+            if(PositionGetInteger(POSITION_MAGIC) == InpMagic) total_pos++;
 
-    if(total_pos >= InpMaxOrders) return;
+    if(total_pos < InpMaxOrders) {
+        double p = SymbolInfoDouble(state.name, SYMBOL_POINT);
+        
+        // AUTO-FILLING SELECTOR
+        uint filling = (uint)SymbolInfoInteger(state.name, SYMBOL_FILLING_MODE);
+        if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
+        else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
+        else trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
-    MqlTick t;
-    if(!SymbolInfoTick(sym, t)) return;
-
-    double p = SymbolInfoDouble(sym, SYMBOL_POINT);
-    
-    // REPLACED GetTypeFilling() with manual bitmask check to fix compilation error
-    uint filling = (uint)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
-    if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
-    else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
-    else trade.SetTypeFilling(ORDER_FILLING_RETURN);
-
-    if(is_buy) trade.Buy(InpLotSize, sym, t.ask, t.bid - InpSL * p, t.ask + InpTP * p, "Apex Long");
-    else trade.Sell(InpLotSize, sym, t.bid, t.ask + InpSL * p, t.bid - InpTP * p, "Apex Short");
+        if(ofi >= InpOFIThreshold) {
+            trade.Buy(InpLotSize, state.name, curr_t.ask, curr_t.bid - InpSL*p, curr_t.ask + InpTP*p, "Pulse Long");
+        }
+        else if(ofi <= -InpOFIThreshold) {
+            trade.Sell(InpLotSize, state.name, curr_t.bid, curr_t.ask + InpSL*p, curr_t.bid - InpTP*p, "Pulse Short");
+        }
+    }
+    state.prev_t = curr_t;
 }
 EOF
 
-# 5. Build Script
+# 5. Fixed Install Script
 RUN cat > /root/install_ea.sh << 'EOF'
 #!/bin/bash
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
 [ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 mkdir -p "$DATA_DIR/Experts"
-cp /root/AggressiveSniper_v9_7.mq5 "$DATA_DIR/Experts/AggressiveSniper_v9_7.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/AggressiveSniper_v9_7.mq5" /log:"/root/compile.log"
+cp /root/PulseSniper_v10.mq5 "$DATA_DIR/Experts/PulseSniper_v10.mq5"
+EDITOR="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
+[ -f "$EDITOR" ] && wine "$EDITOR" /compile:"$DATA_DIR/Experts/PulseSniper_v10.mq5" /log:"/root/compile.log"
 EOF
 RUN chmod +x /root/install_ea.sh
 
