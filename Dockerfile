@@ -7,11 +7,8 @@ ENV DISPLAY=:1
 ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV WINEDEBUG=-all
-ENV QT_X11_NO_MITSHM=1          # Prevents hidden X11 crashes
+ENV QT_X11_NO_MITSHM=1
 
-# ============================================
-# 1. SYSTEM + WINE (FIXED)
-# ============================================
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y \
     wine64 wine32:i386 winbind \
     xvfb fluxbox x11vnc novnc websockify \
@@ -20,46 +17,30 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y \
     build-essential python3-dev gcc \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ============================================
-# 2. PYTHON LIBS
-# ============================================
 RUN pip install --no-cache-dir mt5linux rpyc
 
-# ============================================
-# 3. DOWNLOAD MT5
-# ============================================
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# ============================================
-# 4. EA FILE (FULL MULTI-PAIR OFI)
-# ============================================
 RUN cat > /root/MultiOFI_VX.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
-
 #property copyright "Multi-Pair OFI Scalper"
 #property version   "6.00"
 #property strict
-
 input double InpLotSize      = 0.1;
 input int    InpOFIThreshold = 2;
 input int    InpTP           = 15;
 input int    InpSL           = 40;
 input int    InpMaxOrders    = 2;
 input int    InpMagic        = 555001;
-
 CTrade trade;
-
 struct SymbolData {
     string name;
     MqlTick prev_t;
     bool first_tick;
 };
-
 SymbolData symbols[];
-
 int OnInit() {
     trade.SetExpertMagicNumber(InpMagic);
-    
     int total_symbols = SymbolsTotal(false);
     int count = 0;
     for(int i=0; i<total_symbols; i++) {
@@ -76,13 +57,10 @@ int OnInit() {
     EventSetMillisecondTimer(50);
     return(INIT_SUCCEEDED);
 }
-
 void OnDeinit(const int reason) { EventKillTimer(); }
-
 void OnTimer() {
     for(int i=0; i<ArraySize(symbols); i++) ProcessSymbol(i);
 }
-
 void ProcessSymbol(int idx) {
     string sym = symbols[idx].name;
     MqlTick curr_t;
@@ -94,15 +72,12 @@ void ProcessSymbol(int idx) {
         return;
     }
     if(curr_t.time_msc == symbols[idx].prev_t.time_msc) return;
-
     long v = (long)curr_t.volume_real;
     if(v <= 0) v = (long)curr_t.volume;
     if(v <= 0) v = 1;
-
     long delta_bid = (curr_t.bid > symbols[idx].prev_t.bid) ? v : (curr_t.bid < symbols[idx].prev_t.bid ? -v : 0);
     long delta_ask = (curr_t.ask < symbols[idx].prev_t.ask) ? v : (curr_t.ask > symbols[idx].prev_t.ask ? -v : 0);
     long ofi = delta_bid - delta_ask;
-    
     int total = 0;
     for(int i=PositionsTotal()-1; i>=0; i--) {
         if(PositionSelectByTicket(PositionGetTicket(i))) {
@@ -116,7 +91,6 @@ void ProcessSymbol(int idx) {
         if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
         else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
         else trade.SetTypeFilling(ORDER_FILLING_RETURN);
-
         double point = SymbolInfoDouble(sym, SYMBOL_POINT);
         if(ofi >= InpOFIThreshold) {
             trade.Buy(InpLotSize, sym, curr_t.ask, curr_t.bid - InpSL*point, curr_t.ask + InpTP*point, "OFI Buy");
@@ -129,44 +103,31 @@ void ProcessSymbol(int idx) {
 }
 EOF
 
-# ============================================
-# 5. INSTALL EA SCRIPT
-# ============================================
 RUN cat > /root/install_ea.sh << 'EOF'
 #!/bin/bash
-
 echo "Searching MT5 data folder..."
-
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
-
 if [ -z "$DATA_DIR" ]; then
     echo "Fallback path used"
     DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 fi
-
 mkdir -p "$DATA_DIR/Experts"
 cp /root/MultiOFI_VX.mq5 "$DATA_DIR/Experts/"
-
 echo "EA installed at $DATA_DIR/Experts"
 EOF
 
 RUN chmod +x /root/install_ea.sh
 
-# ============================================
-# 6. PYTHON HFT BOT (FIXED CONNECTION + RETRIES)
-# ============================================
 RUN cat > /root/hft_trader.py << 'EOF'
 import time
 import mt5linux as mt5
 
 def wait_for_connection():
-    for i in range(60):          # up to 3 minutes retries
+    for i in range(60):
         try:
-            # Try bridge connection
             if mt5.initialize(host="127.0.0.1", port=8001):
                 print("Connected via RPyC bridge")
                 return True
-            # Fallback direct (rare but possible)
             if mt5.initialize():
                 print("Connected directly")
                 return True
@@ -176,13 +137,12 @@ def wait_for_connection():
     return False
 
 print("Waiting MT5 and bridge...")
-time.sleep(60)   # increased from 40 to allow full Wine/MT5 start
+time.sleep(60)
 
 if not wait_for_connection():
     print("FATAL: Could not connect to MT5")
     exit(1)
 
-# Fetch all .vx symbols
 symbols = [s.name for s in mt5.symbols_get() if ".vx" in s.name]
 
 if not symbols:
@@ -205,18 +165,14 @@ while True:
         t = mt5.symbol_info_tick(sym)
         if not t or t.bid <= 0 or t.ask <= 0:
             continue
-
         if sym not in prev_ticks:
             prev_ticks[sym] = t
             continue
-
         vol = t.volume if t.volume > 0 else 1
         delta_bid = vol if t.bid > prev_ticks[sym].bid else (-vol if t.bid < prev_ticks[sym].bid else 0)
         delta_ask = vol if t.ask < prev_ticks[sym].ask else (-vol if t.ask > prev_ticks[sym].ask else 0)
         ofi = delta_bid - delta_ask
-
         if abs(ofi) >= 1:
-            # Count open positions for this symbol with our magic number
             positions = mt5.positions_get(symbol=sym)
             open_positions = [p for p in (positions or []) if p.magic == magic]
             if len(open_positions) < 2:
@@ -259,58 +215,41 @@ while True:
                         print(f"Sell {sym} at {t.bid}")
                     else:
                         print(f"Sell failed {sym}: {res.comment} (code {res.retcode})")
-
         prev_ticks[sym] = t
-
-    time.sleep(0.05)   # 50ms loop – aggressive HFT
+    time.sleep(0.05)
 EOF
 
-# ============================================
-# 7. ENTRYPOINT (FIXED TIMING)
-# ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
-
 echo "Starting X server..."
 rm -rf /tmp/.X*
 Xvfb :1 -screen 0 1280x800x16 &
 sleep 3
-
 fluxbox &
 x11vnc -display :1 -forever -nopw -shared -rfbport 5900 &
 websockify --web /usr/share/novnc/ 8080 localhost:5900 &
-
 echo "Initializing Wine..."
 wineboot --init
 sleep 10
-
 MT5="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-
 if [ ! -f "$MT5" ]; then
     echo "Installing MT5..."
     wine /root/mt5setup.exe /auto
     sleep 120
 fi
-
 echo "Launching MT5..."
 wine "$MT5" &
-
 echo "Waiting MT5 full startup (Wine needs ~90s)..."
 sleep 90
-
 echo "Installing EA..."
 bash /root/install_ea.sh
-
 echo "Starting mt5linux bridge..."
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
-
 echo "Waiting bridge to become ready..."
 sleep 20
-
 echo "Starting Python trader..."
 python3 /root/hft_trader.py &
-
 echo "System READY – HFT active"
 tail -f /dev/null
 EOF
