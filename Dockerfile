@@ -19,92 +19,145 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
-#include <Trade\Trade.mqh>
-
-#property copyright "Omni-Apex V19.2 FIXED"
-#property version   "19.20"
+//+------------------------------------------------------------------+
+//|                                            OrderFlowImbalance.mq5 |
+//|                                      Fast in, fast out on profit |
+//+------------------------------------------------------------------+
+#property copyright "Omni-Apex"
+#property version   "1.00"
 #property strict
 
-// --- INPUTS
-input string BinanceSymbol     = "BTCUSDT";
-input double RiskPercent       = 3.0;        // High Risk for 50+ trades/hr
-input int    MinGap_BPS        = 4;          // Tightened for higher frequency
-input int    Fee_BPS           = 14;         // Covers spread + commissions
-input int    TradeCooldown_Sec = 1;          // Ultra-fast recycle
-input int    MaxOpenPositions  = 10;         // Allow stacking for volume
-input int    MaxSpreadPoints   = 500;
-input int    MagicNumber       = 999019;
+#include <Trade\Trade.mqh>
 
-// --- GLOBALS
+// --- INPUTS --------------------------------------------------------+
+input double   RiskPercent       = 2.0;       // % of equity per trade
+input int      ImbalanceWindowMs = 3000;      // Time window for net delta (milliseconds)
+input int      MinNetDelta       = 1;         // Minimum net delta to trigger trade (>=1)
+input int      MaxOpenPositions  = 10;        // Max concurrent trades
+input int      MagicNumber       = 999111;    // EA identifier
+input bool     UseTickVolume     = true;      // Weight delta by tick volume? (true=volume, false=counts)
+
+// --- GLOBALS -------------------------------------------------------+
 CTrade trade;
-string binance_url;
-datetime last_trade_time = 0;
+struct TickRecord {
+   datetime time_ms;
+   int      delta;        // +1 for buy, -1 for sell, or weighted by volume
+};
+TickRecord tickBuffer[];   // dynamic array to store recent ticks
+int totalDelta = 0;
+datetime lastDebugTime = 0;
 
-// --- SAFE JSON PARSER
-double ExtractPrice(string text, string key) {
-   int pos = StringFind(text, key);
-   if(pos == -1) return 0;
-   int start = pos + StringLen(key);
-   int end = StringFind(text, "\"", start);
-   if(end == -1) return 0;
-   return StringToDouble(StringSubstr(text, start, end - start));
-}
-
-// --- DYNAMIC LOTS
-double GetDynamicLot() {
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lot = (equity / 1000.0) * (RiskPercent / 2.0) * 0.2;
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   return NormalizeDouble(MathMax(minLot, lot), 2);
-}
-
-void OnInit() {
-   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
+//+------------------------------------------------------------------+
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
+int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   trade.SetDeviationInPoints(30);
-   Print("🚀 V19.2 AGGRESSOR ONLINE | Target: High Volume Scalping");
+   ArrayResize(tickBuffer, 0);
+   Print("==============================================");
+   Print("🟢 Order Flow Imbalance EA started");
+   Print("   Window: ", ImbalanceWindowMs, " ms");
+   Print("   MinNetDelta: ", MinNetDelta);
+   Print("   RiskPercent: ", RiskPercent, "%");
+   Print("==============================================");
+   return(INIT_SUCCEEDED);
 }
 
+//+------------------------------------------------------------------+
+//| Expert tick function                                            |
+//+------------------------------------------------------------------+
 void OnTick() {
-   if(PositionsTotal() >= MaxOpenPositions) return;
-   if(TimeCurrent() - last_trade_time < TradeCooldown_Sec) return;
-
-   double m_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double m_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double spread = (m_ask - m_bid) / _Point;
-   if(spread > MaxSpreadPoints) return;
-
-   // --- FIXED WEBREQUEST (Correct 9-parameter signature)
-   char post[], result[];
-   string headers;
-   int timeout = 100;
-   
-   // Signature: method, url, headers, timeout, post[], result[], result_headers
-   int res = WebRequest("GET", binance_url, NULL, NULL, timeout, post, 0, result, headers);
-
-   if(res <= 0) return;
-
-   string response = CharArrayToString(result);
-   double b_ask = ExtractPrice(response, "\"askPrice\":\"");
-   double b_bid = ExtractPrice(response, "\"bidPrice\":\"");
-   if(b_ask <= 0 || b_bid <= 0) return;
-
-   double buy_gap = (b_bid - m_ask) / m_ask * 10000.0;
-   double sell_gap = (m_bid - b_ask) / b_ask * 10000.0;
-   double lot = GetDynamicLot();
-
-   // --- EXECUTION LOGIC
-   if(buy_gap > (MinGap_BPS + Fee_BPS)) {
-      if(trade.Buy(lot, _Symbol, m_ask, 0, 0, "Apex Aggressor")) {
-         last_trade_time = TimeCurrent();
-         Print("🔥 BUY | Gap: ", buy_gap);
+   // --- 1. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT) ---
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         if(profit > 0.0) {
+            if(trade.PositionClose(ticket))
+               Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
+            else
+               Print("❌ [CLOSE] Failed, error: ", GetLastError());
+         }
       }
    }
-   else if(sell_gap > (MinGap_BPS + Fee_BPS)) {
-      if(trade.Sell(lot, _Symbol, m_bid, 0, 0, "Apex Aggressor")) {
-         last_trade_time = TimeCurrent();
-         Print("🔥 SELL | Gap: ", sell_gap);
+
+   // --- 2. POSITION LIMIT ---
+   if(PositionsTotal() >= MaxOpenPositions) return;
+
+   // --- 3. GET CURRENT TICK AND DETECT AGGRESSOR ---
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick)) return;
+
+   // Determine if this tick is an aggressive buy or sell
+   int delta = 0;
+   bool isNewTrade = false;
+   if((tick.flags & TICK_FLAG_BUY) == TICK_FLAG_BUY) {
+      delta = UseTickVolume ? (int)MathMax(1, tick.volume) : 1;
+      isNewTrade = true;
+   }
+   else if((tick.flags & TICK_FLAG_SELL) == TICK_FLAG_SELL) {
+      delta = UseTickVolume ? -(int)MathMax(1, tick.volume) : -1;
+      isNewTrade = true;
+   }
+
+   // If it's a new trade tick, add to buffer and update total delta
+   if(isNewTrade) {
+      TickRecord newTick;
+      newTick.time_ms = tick.time_msc;   // millisecond precision
+      newTick.delta   = delta;
+      ArrayResize(tickBuffer, ArraySize(tickBuffer)+1);
+      tickBuffer[ArraySize(tickBuffer)-1] = newTick;
+      totalDelta += delta;
+
+      // Remove ticks older than ImbalanceWindowMs
+      datetime cutoff = tick.time_msc - ImbalanceWindowMs;
+      int removeCount = 0;
+      for(int j = 0; j < ArraySize(tickBuffer); j++) {
+         if(tickBuffer[j].time_ms < cutoff) {
+            totalDelta -= tickBuffer[j].delta;
+            removeCount++;
+         } else break;
+      }
+      if(removeCount > 0) {
+         int newSize = ArraySize(tickBuffer) - removeCount;
+         for(int j = 0; j < newSize; j++)
+            tickBuffer[j] = tickBuffer[j+removeCount];
+         ArrayResize(tickBuffer, newSize);
+      }
+   }
+
+   // --- 4. DEBUG OUTPUT (every 2 seconds) ---
+   if(TimeCurrent() - lastDebugTime >= 2) {
+      lastDebugTime = TimeCurrent();
+      Print("========================================");
+      Print("📊 Net Delta (", ImbalanceWindowMs, "ms): ", totalDelta);
+      Print("   Min threshold: ", MinNetDelta);
+      Print("   Active positions: ", PositionsTotal());
+      Print("   Tick buffer size: ", ArraySize(tickBuffer));
+      Print("========================================");
+   }
+
+   // --- 5. OPEN TRADE BASED ON IMBALANCE ---
+   if(totalDelta >= MinNetDelta) {
+      // Strong buying pressure → BUY
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
+      lot = MathMax(0.01, lot);
+      if(trade.Buy(lot, _Symbol, ask, 0, 0, "Imbalance Buy")) {
+         Print("🔥 [BUY OPEN] NetDelta=", totalDelta, " Lot=", lot, " @ ", ask);
+      } else {
+         Print("❌ [BUY FAIL] Error: ", GetLastError());
+      }
+   }
+   else if(totalDelta <= -MinNetDelta) {
+      // Strong selling pressure → SELL
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
+      lot = MathMax(0.01, lot);
+      if(trade.Sell(lot, _Symbol, bid, 0, 0, "Imbalance Sell")) {
+         Print("🔥 [SELL OPEN] NetDelta=", totalDelta, " Lot=", lot, " @ ", bid);
+      } else {
+         Print("❌ [SELL FAIL] Error: ", GetLastError());
       }
    }
 }
