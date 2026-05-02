@@ -20,32 +20,32 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                        OrderFlowImbalance_V2.mq5 |
-//|                              Fast in/out, any profit close       |
+//|                                        BidAskPressureFast.mq5   |
+//|                     Fast in/out on profit using bid/ask tick rate|
 //+------------------------------------------------------------------+
 #property copyright "Omni-Apex"
-#property version   "2.00"
+#property version   "1.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 // --- INPUTS --------------------------------------------------------+
-input double   RiskPercent       = 2.0;       // % of equity per trade
-input int      ImbalanceWindowMs = 3000;      // Time window for net delta (ms)
-input int      MinNetDelta       = 1;         // Min net delta to trigger trade
-input int      MaxOpenPositions  = 10;
-input int      MagicNumber       = 999111;
-input bool     UseTickVolume     = true;      // Weight delta by volume? (volume or 1)
+input double   RiskPercent       = 5.0;          // % of equity per trade
+input int      WindowMs          = 2000;         // Rolling window (milliseconds)
+input int      MinNetPressure    = 1;            // Minimum net pressure to trigger trade
+input int      MaxOpenPositions  = 20;
+input int      MagicNumber       = 777888;
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
 struct TickRecord {
    datetime time_ms;
-   int      delta;        // positive = buy, negative = sell (weighted by volume if enabled)
+   int      pressure;     // +1 for ask change, -1 for bid change
 };
-TickRecord tickBuffer[];
-int totalDelta = 0;
-datetime lastDebugTime = 0;
+TickRecord buffer[];
+int totalPressure = 0;
+datetime lastDebug = 0;
+double lastAsk = 0, lastBid = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
@@ -53,39 +53,23 @@ datetime lastDebugTime = 0;
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   ArrayResize(tickBuffer, 0);
+   ArrayResize(buffer, 0);
+   // Initialize last prices
+   lastAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   lastBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    Print("==============================================");
-   Print("🟢 Order Flow Imbalance EA V2 (Price-based)");
-   Print("   Window: ", ImbalanceWindowMs, " ms | MinDelta: ", MinNetDelta);
-   Print("   Risk: ", RiskPercent, "% | Volume weighting: ", UseTickVolume);
+   Print("🟢 BID/ASK PRESSURE EA (Tick Frequency)");
+   Print("   Window: ", WindowMs, " ms | MinPressure: ", MinNetPressure);
+   Print("   Risk: ", RiskPercent, "% | Fast close on profit");
    Print("==============================================");
    return(INIT_SUCCEEDED);
-}
-
-//+------------------------------------------------------------------+
-//| Determine aggression from tick price relative to bid/ask        |
-//+------------------------------------------------------------------+
-int GetDeltaFromTick(MqlTick &tick) {
-   // If no volume or invalid price, return 0 (ignore)
-   if(tick.volume == 0 || tick.last <= 0) return 0;
-   
-   // Aggressive buy: last price is at or above ask
-   if(tick.last >= tick.ask - (tick.ask - tick.bid) * 0.1) {  // allow tiny slippage
-      return UseTickVolume ? (int)MathMax(1, tick.volume) : 1;
-   }
-   // Aggressive sell: last price is at or below bid
-   else if(tick.last <= tick.bid + (tick.ask - tick.bid) * 0.1) {
-      return UseTickVolume ? -(int)MathMax(1, tick.volume) : -1;
-   }
-   // Tick inside spread – could be a quote update or ambiguous trade
-   return 0;
 }
 
 //+------------------------------------------------------------------+
 //| Expert tick function                                            |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // 1. Close profitable positions
+   // 1. Close any position with profit > 0
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
@@ -101,62 +85,74 @@ void OnTick() {
    
    if(PositionsTotal() >= MaxOpenPositions) return;
    
-   // 2. Get current tick
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol, tick)) return;
+   // 2. Get current bid/ask
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(currentAsk <= 0 || currentBid <= 0) return;
    
-   // 3. Detect aggressor using price
-   int delta = GetDeltaFromTick(tick);
-   if(delta != 0) {
-      // Add to buffer
-      TickRecord newTick;
-      newTick.time_ms = tick.time_msc;
-      newTick.delta = delta;
-      ArrayResize(tickBuffer, ArraySize(tickBuffer)+1);
-      tickBuffer[ArraySize(tickBuffer)-1] = newTick;
-      totalDelta += delta;
+   // 3. Detect changes and record pressure
+   bool askChanged = (currentAsk != lastAsk);
+   bool bidChanged = (currentBid != lastBid);
+   int pressure = 0;
+   if(askChanged && !bidChanged) pressure = 1;        // ask changed alone → buying pressure
+   else if(!askChanged && bidChanged) pressure = -1;  // bid changed alone → selling pressure
+   else if(askChanged && bidChanged) pressure = 0;    // both changed → ambiguous, ignore
+   
+   if(pressure != 0) {
+      MqlTick tick;
+      SymbolInfoTick(_Symbol, tick);  // get precise time in ms
+      TickRecord rec;
+      rec.time_ms = tick.time_msc;
+      rec.pressure = pressure;
+      ArrayResize(buffer, ArraySize(buffer)+1);
+      buffer[ArraySize(buffer)-1] = rec;
+      totalPressure += pressure;
       
-      // Remove old ticks
-      datetime cutoff = tick.time_msc - ImbalanceWindowMs;
+      // Remove old records outside window
+      datetime cutoff = tick.time_msc - WindowMs;
       int removeCount = 0;
-      for(int j = 0; j < ArraySize(tickBuffer); j++) {
-         if(tickBuffer[j].time_ms < cutoff) {
-            totalDelta -= tickBuffer[j].delta;
+      for(int j = 0; j < ArraySize(buffer); j++) {
+         if(buffer[j].time_ms < cutoff) {
+            totalPressure -= buffer[j].pressure;
             removeCount++;
          } else break;
       }
       if(removeCount > 0) {
-         int newSize = ArraySize(tickBuffer) - removeCount;
+         int newSize = ArraySize(buffer) - removeCount;
          for(int j = 0; j < newSize; j++)
-            tickBuffer[j] = tickBuffer[j+removeCount];
-         ArrayResize(tickBuffer, newSize);
+            buffer[j] = buffer[j+removeCount];
+         ArrayResize(buffer, newSize);
       }
    }
    
-   // 4. Debug every 2 seconds
-   if(TimeCurrent() - lastDebugTime >= 2) {
-      lastDebugTime = TimeCurrent();
+   // Update last prices
+   lastAsk = currentAsk;
+   lastBid = currentBid;
+   
+   // 4. Debug every 3 seconds
+   if(TimeCurrent() - lastDebug >= 3) {
+      lastDebug = TimeCurrent();
       Print("========================================");
-      Print("📊 Net Delta (", ImbalanceWindowMs, "ms): ", totalDelta);
-      Print("   Threshold: ±", MinNetDelta, " | Positions: ", PositionsTotal());
-      Print("   Buffer size: ", ArraySize(tickBuffer), " | Last Price: ", tick.last);
-      Print("   Bid: ", tick.bid, " Ask: ", tick.ask);
+      Print("📊 Net Pressure (", WindowMs, "ms): ", totalPressure);
+      Print("   Threshold: ±", MinNetPressure, " | Positions: ", PositionsTotal());
+      Print("   Buffer size: ", ArraySize(buffer));
+      Print("   Ask: ", currentAsk, " Bid: ", currentBid);
       Print("========================================");
    }
    
-   // 5. Trade signal
+   // 5. Trade signals
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    
-   if(totalDelta >= MinNetDelta) {
-      if(trade.Buy(lot, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_ASK), 0, 0, "Imbalance Buy"))
-         Print("🔥 [BUY OPEN] NetDelta=", totalDelta);
+   if(totalPressure >= MinNetPressure) {
+      if(trade.Buy(lot, _Symbol, currentAsk, 0, 0, "Pressure Buy"))
+         Print("🔥 [BUY] Pressure = ", totalPressure);
       else
          Print("❌ [BUY FAIL] Error: ", GetLastError());
    }
-   else if(totalDelta <= -MinNetDelta) {
-      if(trade.Sell(lot, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_BID), 0, 0, "Imbalance Sell"))
-         Print("🔥 [SELL OPEN] NetDelta=", totalDelta);
+   else if(totalPressure <= -MinNetPressure) {
+      if(trade.Sell(lot, _Symbol, currentBid, 0, 0, "Pressure Sell"))
+         Print("🔥 [SELL] Pressure = ", totalPressure);
       else
          Print("❌ [SELL FAIL] Error: ", GetLastError());
    }
