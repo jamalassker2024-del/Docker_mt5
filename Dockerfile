@@ -20,11 +20,11 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                        BidAskPressureFast.mq5   |
-//|                     Fast in/out on profit using bid/ask tick rate|
+//|                                        MomentumTickFast.mq5     |
+//|                     Mid-price momentum using every bid/ask tick |
 //+------------------------------------------------------------------+
 #property copyright "Omni-Apex"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -32,20 +32,20 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 // --- INPUTS --------------------------------------------------------+
 input double   RiskPercent       = 5.0;          // % of equity per trade
 input int      WindowMs          = 2000;         // Rolling window (milliseconds)
-input int      MinNetPressure    = 1;            // Minimum net pressure to trigger trade
+input int      MinNetMomentum    = 1;            // Minimum net momentum to trigger trade
 input int      MaxOpenPositions  = 20;
-input int      MagicNumber       = 777888;
+input int      MagicNumber       = 999555;
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
 struct TickRecord {
    datetime time_ms;
-   int      pressure;     // +1 for ask change, -1 for bid change
+   int      momentum;     // +1 for mid increase, -1 for mid decrease
 };
 TickRecord buffer[];
-int totalPressure = 0;
+int totalMomentum = 0;
 datetime lastDebug = 0;
-double lastAsk = 0, lastBid = 0;
+double lastMid = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
@@ -54,12 +54,13 @@ int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
    ArrayResize(buffer, 0);
-   // Initialize last prices
-   lastAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   lastBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   // Initialize with current mid
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   lastMid = (ask + bid) / 2.0;
    Print("==============================================");
-   Print("🟢 BID/ASK PRESSURE EA (Tick Frequency)");
-   Print("   Window: ", WindowMs, " ms | MinPressure: ", MinNetPressure);
+   Print("🟢 MID-PRICE MOMENTUM EA (Every tick gives signal)");
+   Print("   Window: ", WindowMs, " ms | MinMomentum: ", MinNetMomentum);
    Print("   Risk: ", RiskPercent, "% | Fast close on profit");
    Print("==============================================");
    return(INIT_SUCCEEDED);
@@ -69,7 +70,7 @@ int OnInit() {
 //| Expert tick function                                            |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // 1. Close any position with profit > 0
+   // 1. Close any profitable position immediately
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
@@ -85,35 +86,34 @@ void OnTick() {
    
    if(PositionsTotal() >= MaxOpenPositions) return;
    
-   // 2. Get current bid/ask
-   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(currentAsk <= 0 || currentBid <= 0) return;
+   // 2. Get current prices and compute mid
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0 || bid <= 0) return;
+   double currentMid = (ask + bid) / 2.0;
    
-   // 3. Detect changes and record pressure
-   bool askChanged = (currentAsk != lastAsk);
-   bool bidChanged = (currentBid != lastBid);
-   int pressure = 0;
-   if(askChanged && !bidChanged) pressure = 1;        // ask changed alone → buying pressure
-   else if(!askChanged && bidChanged) pressure = -1;  // bid changed alone → selling pressure
-   else if(askChanged && bidChanged) pressure = 0;    // both changed → ambiguous, ignore
+   // 3. Determine momentum direction
+   int momentum = 0;
+   if(currentMid > lastMid) momentum = 1;
+   else if(currentMid < lastMid) momentum = -1;
+   else momentum = 0;   // no change, ignore
    
-   if(pressure != 0) {
+   if(momentum != 0) {
       MqlTick tick;
-      SymbolInfoTick(_Symbol, tick);  // get precise time in ms
+      SymbolInfoTick(_Symbol, tick);
       TickRecord rec;
       rec.time_ms = tick.time_msc;
-      rec.pressure = pressure;
+      rec.momentum = momentum;
       ArrayResize(buffer, ArraySize(buffer)+1);
       buffer[ArraySize(buffer)-1] = rec;
-      totalPressure += pressure;
+      totalMomentum += momentum;
       
-      // Remove old records outside window
+      // Remove old records
       datetime cutoff = tick.time_msc - WindowMs;
       int removeCount = 0;
       for(int j = 0; j < ArraySize(buffer); j++) {
          if(buffer[j].time_ms < cutoff) {
-            totalPressure -= buffer[j].pressure;
+            totalMomentum -= buffer[j].momentum;
             removeCount++;
          } else break;
       }
@@ -124,19 +124,16 @@ void OnTick() {
          ArrayResize(buffer, newSize);
       }
    }
-   
-   // Update last prices
-   lastAsk = currentAsk;
-   lastBid = currentBid;
+   lastMid = currentMid;
    
    // 4. Debug every 3 seconds
    if(TimeCurrent() - lastDebug >= 3) {
       lastDebug = TimeCurrent();
       Print("========================================");
-      Print("📊 Net Pressure (", WindowMs, "ms): ", totalPressure);
-      Print("   Threshold: ±", MinNetPressure, " | Positions: ", PositionsTotal());
+      Print("📊 Net Momentum (", WindowMs, "ms): ", totalMomentum);
+      Print("   Threshold: ±", MinNetMomentum, " | Positions: ", PositionsTotal());
       Print("   Buffer size: ", ArraySize(buffer));
-      Print("   Ask: ", currentAsk, " Bid: ", currentBid);
+      Print("   Mid: ", DoubleToString(currentMid, _Digits));
       Print("========================================");
    }
    
@@ -144,15 +141,15 @@ void OnTick() {
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    
-   if(totalPressure >= MinNetPressure) {
-      if(trade.Buy(lot, _Symbol, currentAsk, 0, 0, "Pressure Buy"))
-         Print("🔥 [BUY] Pressure = ", totalPressure);
+   if(totalMomentum >= MinNetMomentum) {
+      if(trade.Buy(lot, _Symbol, ask, 0, 0, "Momentum Buy"))
+         Print("🔥 [BUY] NetMomentum = ", totalMomentum);
       else
          Print("❌ [BUY FAIL] Error: ", GetLastError());
    }
-   else if(totalPressure <= -MinNetPressure) {
-      if(trade.Sell(lot, _Symbol, currentBid, 0, 0, "Pressure Sell"))
-         Print("🔥 [SELL] Pressure = ", totalPressure);
+   else if(totalMomentum <= -MinNetMomentum) {
+      if(trade.Sell(lot, _Symbol, bid, 0, 0, "Momentum Sell"))
+         Print("🔥 [SELL] NetMomentum = ", totalMomentum);
       else
          Print("❌ [SELL FAIL] Error: ", GetLastError());
    }
