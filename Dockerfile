@@ -16,111 +16,81 @@ RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
 # =========================================================
-# V17 - APEX-FORCE (EXPONENTIAL GROWTH & SPREAD ADAPTIVE)
+# V17.1 - CODE REMAINS THE SAME BUT WE FIX FILE PLACEMENT
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V17.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
-
-#property copyright "Omni-Apex V17 Exponential"
-#property version   "17.00"
+#property copyright "Omni-Apex V17.1"
+#property version   "17.10"
 #property strict
 
-// --- DYNAMIC INPUTS
-input double RiskPercent      = 2.0;      // Risk 2% of equity per trade (Exponential Growth)
-input double OFI_Threshold    = 1.15;     // Quality filter
+input double RiskPercent      = 2.0;      
+input double OFI_Threshold    = 1.15;     
 input int    LookbackTicks    = 12;       
-input double RewardToSpread   = 2.5;      // TP will be 2.5x the current spread
-input double SLToSpread       = 1.5;      // SL will be 1.5x the current spread
+input double RewardToSpread   = 2.5;      
+input double SLToSpread       = 1.5;      
 input int    MaxSpread_Pips   = 450;      
 input int    MagicNumber      = 999017;
 
 struct TickRecord { int dir; long vol; long msc; };
 TickRecord tickBuffer[];
-int        tickIdx = 0;
-CTrade     trade;
-double     lastPrice = 0;
+int tickIdx = 0;
+CTrade trade;
+double lastPrice = 0;
 
 int OnInit() {
    ArrayResize(tickBuffer, LookbackTicks);
    trade.SetExpertMagicNumber(MagicNumber);
-   
    uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
    if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
    else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
    else trade.SetTypeFilling(ORDER_FILLING_RETURN);
-
-   Print("V17 APEX-FORCE ONLINE: Exponential Mode Active");
+   Print("V17.1 ONLINE");
    return(INIT_SUCCEEDED);
 }
 
-// --- EXPONENTIAL LOT CALCULATION ---
 double GetDynamicLot(double sl_points) {
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   
    if(sl_points <= 0 || tickValue <= 0) return 0.1;
-   
    double lot = (equity * (RiskPercent / 100.0)) / (sl_points * (tickValue / tickSize));
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   
-   return NormalizeDouble(MathMax(minLot, MathMin(maxLot, lot)), 2);
+   return NormalizeDouble(MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), MathMin(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX), lot)), 2);
 }
 
 void OnTick() {
    MqlTick curr;
    if(!SymbolInfoTick(_Symbol, curr)) return;
-
-   double bid = curr.bid; double ask = curr.ask;
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double spread_points = (ask - bid) / point;
-
-   int direction = (lastPrice > 0) ? (bid > lastPrice ? 1 : (bid < lastPrice ? -1 : 0)) : 0;
-   lastPrice = bid;
-
+   double spread_points = (curr.ask - curr.bid) / point;
+   int direction = (lastPrice > 0) ? (curr.bid > lastPrice ? 1 : (curr.bid < lastPrice ? -1 : 0)) : 0;
+   lastPrice = curr.bid;
    tickBuffer[tickIdx % LookbackTicks].dir = direction;
    tickBuffer[tickIdx % LookbackTicks].vol = (curr.volume_real > 0) ? (long)curr.volume_real : 1;
    tickBuffer[tickIdx % LookbackTicks].msc = curr.time_msc;
    tickIdx++;
-
    if(tickIdx < LookbackTicks || PositionsTotal() >= 1) return;
-
-   // OFI & Momentum
    long buyVol = 0, sellVol = 0; int momentum = 0;
    for(int i=0; i<LookbackTicks; i++) {
       if(tickBuffer[i].dir > 0) { buyVol += tickBuffer[i].vol; momentum++; }
       if(tickBuffer[i].dir < 0) { sellVol += tickBuffer[i].vol; momentum--; }
    }
-   
-   // Tick Velocity (Aggression check)
    long timeElapsed = tickBuffer[(tickIdx-1)%LookbackTicks].msc - tickBuffer[tickIdx%LookbackTicks].msc;
-   if(timeElapsed > 1500 || timeElapsed <= 0) return; // Only trade if last X ticks were fast
-
+   if(timeElapsed > 1500 || timeElapsed <= 0) return;
    double ratio = (sellVol > 0) ? (double)buyVol / (double)sellVol : (double)buyVol;
-   
-   // --- SPREAD-ADAPTIVE SL/TP ---
    double sl_dist_pts = spread_points * SLToSpread;
    double tp_dist_pts = spread_points * RewardToSpread;
    double lot = GetDynamicLot(sl_dist_pts);
-
-   // BUY EXECUTION
    if(ratio >= OFI_Threshold && momentum > (LookbackTicks/2)) {
-      double sl = ask - (sl_dist_pts * point);
-      double tp = ask + (tp_dist_pts * point);
-      trade.Buy(lot, _Symbol, ask, sl, tp, "Apex Buy");
-   }
-   // SELL EXECUTION
-   else if(ratio <= (1.0 / OFI_Threshold) && momentum < -(LookbackTicks/2)) {
-      double sl = bid + (sl_dist_pts * point);
-      double tp = bid - (tp_dist_pts * point);
-      trade.Sell(lot, _Symbol, bid, sl, tp, "Apex Sell");
+      trade.Buy(lot, _Symbol, curr.ask, curr.ask - (sl_dist_pts * point), curr.ask + (tp_dist_pts * point), "Apex");
+   } else if(ratio <= (1.0 / OFI_Threshold) && momentum < -(LookbackTicks/2)) {
+      trade.Sell(lot, _Symbol, curr.bid, curr.bid + (sl_dist_pts * point), curr.bid - (tp_dist_pts * point), "Apex");
    }
 }
 EOF
 
 # ============================================
-# ENTRYPOINT
+# ENTRYPOINT (CRITICAL PATH FIXES)
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -132,19 +102,48 @@ fluxbox &
 x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
 websockify --web=/usr/share/novnc 8080 0.0.0.0:5900 &
 wineboot --init
-sleep 5
+sleep 10
+
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-[ ! -f "$MT5_EXE" ] && wine /root/mt5setup.exe /auto && sleep 90
+EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
+
+# 1. Install MT5 if missing
+if [ ! -f "$MT5_EXE" ]; then
+    wine /root/mt5setup.exe /auto
+    sleep 90
+fi
+
+# 2. FORCE-DISCOVER THE CORRECT MQL5 FOLDER
+# MT5 often creates a random hash folder in /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/
+MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
+
+if [ -z "$MQL5_DIR" ]; then
+    echo "MQL5 directory not found yet. Starting MT5 once to generate paths..."
+    wine "$MT5_EXE" &
+    sleep 30
+    MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
+fi
+
+echo "Targeting MQL5 Path: $MQL5_DIR"
+mkdir -p "$MQL5_DIR/Experts/Apex"
+cp /root/VALETAX_TICK_BOT_V17.mq5 "$MQL5_DIR/Experts/Apex/VALETAX_TICK_BOT_V17.mq5"
+
+# 3. Compile via wine
+wine "$EDITOR_EXE" /compile:"$MQL5_DIR/Experts/Apex/VALETAX_TICK_BOT_V17.mq5" /log:"/root/compile.log"
+
+# 4. Start MT5 and MT5-Linux bridge
 wine "$MT5_EXE" &
-sleep 30
-
-DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
-mkdir -p "$DATA_DIR/Experts"
-cp /root/VALETAX_TICK_BOT_V17.mq5 "$DATA_DIR/Experts/VALETAX_TICK_BOT_V17.mq5"
-wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/VALETAX_TICK_BOT_V17.mq5" /log:"/root/compile.log"
-
+sleep 20
 python3 -m mt5linux --host 0.0.0.0 --port 8001 &
-tail -f /dev/null
+
+# 5. KEEP ALIVE LOOP (Prevents server disconnects)
+while true; do
+    # Check if processes are still running, restart bridge if it dies
+    if ! pgrep -f "mt5linux" > /dev/null; then
+        python3 -m mt5linux --host 0.0.0.0 --port 8001 &
+    fi
+    sleep 60
+done
 EOF
 
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
