@@ -21,17 +21,18 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V19"
-#property version   "19.00"
+#property copyright "Omni-Apex V19.1 FIXED"
+#property version   "19.10"
 #property strict
 
-// --- AGGRESSIVE INPUTS
-input string BinanceSymbol     = "BTCUSDT"; 
-input double RiskPercent       = 3.0;        // Higher risk for faster growth[cite: 2]
-input int    MinGap_BPS        = 4;          // Lowered to 4bps for high frequency[cite: 1]
-input int    Fee_BPS           = 14;         // Conservative fee estimate[cite: 1]
-input int    TradeCooldown_Sec = 5;          // Only 5 sec wait between trades
-input int    MaxOpenPositions  = 3;          // Allow up to 3 concurrent trades for volume
+// --- INPUTS (BALANCED AGGRESSION)
+input string BinanceSymbol     = "BTCUSDT";
+input double RiskPercent       = 2.5;
+input int    MinGap_BPS        = 6;     // safer than 4
+input int    Fee_BPS           = 12;
+input int    TradeCooldown_Sec = 2;     // faster
+input int    MaxOpenPositions  = 5;
+input int    MaxSpreadPoints   = 300;   // NEW filter
 input int    MagicNumber       = 999019;
 
 // --- GLOBALS
@@ -39,59 +40,106 @@ CTrade trade;
 string binance_url;
 datetime last_trade_time = 0;
 
-int OnInit() {
-   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC); // Extreme speed execution[cite: 2]
-   
-   Print("🚀 V19 AGGRESSOR ONLINE | Target: 50+ trades/hr");
-   return(INIT_SUCCEEDED);
+// --- SAFE JSON PARSER
+double ExtractPrice(string text, string key)
+{
+   int pos = StringFind(text, key);
+   if(pos == -1) return 0;
+
+   int start = pos + StringLen(key);
+   int end = StringFind(text, "\"", start);
+
+   if(end == -1) return 0;
+
+   return StringToDouble(StringSubstr(text, start, end - start));
 }
 
-double GetDynamicLot() {
+// --- LOT CALCULATION
+double GetDynamicLot()
+{
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lot = (equity / 1000.0) * (RiskPercent / 2.0) * 0.2; 
-   return NormalizeDouble(MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), lot), 2);
+   double lot = (equity / 1000.0) * (RiskPercent / 2.0) * 0.15;
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   return NormalizeDouble(MathMax(minLot, MathMin(lot, maxLot)), 2);
 }
 
-void OnTick() {
-   if(PositionsTotal() >= MaxOpenPositions) return;
-   if(TimeCurrent() - last_trade_time < TradeCooldown_Sec) return;
+// --- MAIN
+void OnInit()
+{
+   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
 
-   char post[], result[];
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   trade.SetDeviationInPoints(20); // SLIPPAGE CONTROL
+
+   Print("🚀 V19.1 REAL AGGRESSOR READY");
+}
+
+void OnTick()
+{
+   // LIMIT POSITIONS
+   if(PositionsTotal() >= MaxOpenPositions)
+      return;
+
+   // COOLDOWN
+   if(TimeCurrent() - last_trade_time < TradeCooldown_Sec)
+      return;
+
+   // SPREAD FILTER (CRITICAL)
+   double spread = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) -
+                    SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+
+   if(spread > MaxSpreadPoints)
+      return;
+
+   // REQUEST BINANCE
+   char result[];
    string headers;
-   // High-speed request (30ms timeout)[cite: 1]
-   int res = WebRequest("GET", binance_url, NULL, NULL, 30, post, 0, result, headers);
-   if(res == -1) return;
+
+   int res = WebRequest("GET", binance_url, "", "", 100, result, headers);
+   if(res <= 0)
+      return;
 
    string response = CharArrayToString(result);
-   int ask_pos = StringFind(response, "\"askPrice\":\"");
-   int bid_pos = StringFind(response, "\"bidPrice\":\"");
-   if(ask_pos == -1 || bid_pos == -1) return;
-   
-   double b_ask = StringToDouble(StringSubstr(response, ask_pos + 12));
-   double b_bid = StringToDouble(StringSubstr(response, bid_pos + 12));
+
+   double b_ask = ExtractPrice(response, "\"askPrice\":\"");
+   double b_bid = ExtractPrice(response, "\"bidPrice\":\"");
+
+   if(b_ask == 0 || b_bid == 0)
+      return;
+
    double m_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double m_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   
-   // --- ARBITRAGE GAP LOGIC[cite: 1]
-   // Gap in Basis Points: ((Lead - Lag) / Lag) * 10,000
-   double buy_gap_bps = (b_bid - m_ask) / m_ask * 10000;
-   double sell_gap_bps = (m_bid - b_ask) / b_ask * 10000;
+
+   // GAP CALCULATION
+   double buy_gap = (b_bid - m_ask) / m_ask * 10000.0;
+   double sell_gap = (m_bid - b_ask) / b_ask * 10000.0;
 
    double lot = GetDynamicLot();
-   double tp_dist = (MinGap_BPS * 2) * SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
 
-   if(buy_gap_bps > (MinGap_BPS + Fee_BPS)) {
-      if(trade.Buy(lot, _Symbol, m_ask, 0, m_ask + tp_dist, "Apex Aggressor")) {
+   // SMALL TP (SCALP)
+   double tp_buy  = m_ask + (MinGap_BPS * 1.5) * _Point * 10;
+   double tp_sell = m_bid - (MinGap_BPS * 1.5) * _Point * 10;
+
+   // --- BUY
+   if(buy_gap > (MinGap_BPS + Fee_BPS))
+   {
+      if(trade.Buy(lot, _Symbol, m_ask, 0, tp_buy, "Apex Buy"))
+      {
          last_trade_time = TimeCurrent();
-         PrintFormat("🔥 AGGRESSIVE BUY | Gap: %.2f bps", buy_gap_bps);
+         Print("🔥 BUY | Gap:", buy_gap);
       }
    }
-   else if(sell_gap_bps > (MinGap_BPS + Fee_BPS)) {
-      if(trade.Sell(lot, _Symbol, m_bid, 0, m_bid - tp_dist, "Apex Aggressor")) {
+   // --- SELL
+   else if(sell_gap > (MinGap_BPS + Fee_BPS))
+   {
+      if(trade.Sell(lot, _Symbol, m_bid, 0, tp_sell, "Apex Sell"))
+      {
          last_trade_time = TimeCurrent();
-         PrintFormat("🔥 AGGRESSIVE SELL | Gap: %.2f bps", sell_gap_bps);
+         Print("🔥 SELL | Gap:", sell_gap);
       }
    }
 }
