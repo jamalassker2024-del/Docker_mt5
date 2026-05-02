@@ -15,83 +15,110 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
 RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# ============================================
-# V16 - ULTRA-AGGRESSIVE MOMENTUM TICK BOT
-# ============================================
+# =========================================================
+# V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
+# =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
-#property copyright "Omni-Apex V17.1"
-#property version   "17.10"
+
+#property copyright "Omni-Apex V16.3 Profit-Max"
+#property version   "16.30"
 #property strict
 
-input double RiskPercent      = 2.0;      
-input double OFI_Threshold    = 1.15;     
-input int    LookbackTicks    = 12;       
-input double RewardToSpread   = 2.5;      
-input double SLToSpread       = 1.5;      
-input int    MaxSpread_Pips   = 450;      
-input int    MagicNumber      = 999017;
+// --- ENHANCED INPUTS FOR PROFITABILITY
+input double LotSize          = 1.0;
+input double OFI_Threshold    = 1.25;     // Higher threshold for higher quality signals
+input int    LookbackTicks    = 15;       // Slightly longer to filter noise
+input int    MinStopBuffer    = 50;       // Tighter SL for better RR
+input double RewardRatio      = 1.5;      // Target 1.5x the spread for profitability
+input int    MaxSpread_Pips   = 400;      // Tightened to avoid high-cost trades
+input int    MagicNumber      = 999016;
 
-struct TickRecord { int dir; long vol; long msc; };
+struct TickRecord {
+   int    direction; 
+   long   volume;
+   long   time_msc;
+};
+
 TickRecord tickBuffer[];
-int tickIdx = 0;
-CTrade trade;
-double lastPrice = 0;
+int        tickIdx = 0;
+CTrade     trade;
+double     lastPrice = 0;
 
 int OnInit() {
    ArrayResize(tickBuffer, LookbackTicks);
    trade.SetExpertMagicNumber(MagicNumber);
+   
    uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
    if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
    else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
    else trade.SetTypeFilling(ORDER_FILLING_RETURN);
-   Print("V17.1 ONLINE");
-   return(INIT_SUCCEEDED);
-}
 
-double GetDynamicLot(double sl_points) {
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(sl_points <= 0 || tickValue <= 0) return 0.1;
-   double lot = (equity * (RiskPercent / 100.0)) / (sl_points * (tickValue / tickSize));
-   return NormalizeDouble(MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), MathMin(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX), lot)), 2);
+   Print("V16.3 Profit-Max Booted. RR: ", RewardRatio);
+   return(INIT_SUCCEEDED);
 }
 
 void OnTick() {
    MqlTick curr;
    if(!SymbolInfoTick(_Symbol, curr)) return;
+
+   double bid = curr.bid;
+   double ask = curr.ask;
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double spread_points = (curr.ask - curr.bid) / point;
-   int direction = (lastPrice > 0) ? (curr.bid > lastPrice ? 1 : (curr.bid < lastPrice ? -1 : 0)) : 0;
-   lastPrice = curr.bid;
-   tickBuffer[tickIdx % LookbackTicks].dir = direction;
-   tickBuffer[tickIdx % LookbackTicks].vol = (curr.volume_real > 0) ? (long)curr.volume_real : 1;
-   tickBuffer[tickIdx % LookbackTicks].msc = curr.time_msc;
+   double spread_points = (ask - bid) / point;
+   
+   // --- VELOCITY & MOMENTUM ---
+   int direction = (lastPrice > 0) ? (bid > lastPrice ? 1 : (bid < lastPrice ? -1 : 0)) : 0;
+   lastPrice = bid;
+
+   tickBuffer[tickIdx % LookbackTicks].direction = direction;
+   tickBuffer[tickIdx % LookbackTicks].volume = (curr.volume_real > 0) ? (long)curr.volume_real : 1;
+   tickBuffer[tickIdx % LookbackTicks].time_msc = curr.time_msc;
    tickIdx++;
-   if(tickIdx < LookbackTicks || PositionsTotal() >= 1) return;
-   long buyVol = 0, sellVol = 0; int momentum = 0;
+
+   if(tickIdx < LookbackTicks) return;
+
+   // Calculate OFI and Velocity (ms per tick)
+   long buyVol = 0, sellVol = 0;
+   int momentum = 0;
    for(int i=0; i<LookbackTicks; i++) {
-      if(tickBuffer[i].dir > 0) { buyVol += tickBuffer[i].vol; momentum++; }
-      if(tickBuffer[i].dir < 0) { sellVol += tickBuffer[i].vol; momentum--; }
+      if(tickBuffer[i].direction > 0) { buyVol += tickBuffer[i].volume; momentum++; }
+      if(tickBuffer[i].direction < 0) { sellVol += tickBuffer[i].volume; momentum--; }
    }
-   long timeElapsed = tickBuffer[(tickIdx-1)%LookbackTicks].msc - tickBuffer[tickIdx%LookbackTicks].msc;
-   if(timeElapsed > 1500 || timeElapsed <= 0) return;
+   
+   long timeSpan = tickBuffer[(tickIdx-1)%LookbackTicks].time_msc - tickBuffer[tickIdx%LookbackTicks].time_msc;
+   double velocity = (timeSpan > 0) ? (double)LookbackTicks / (double)timeSpan : 0;
+
    double ratio = (sellVol > 0) ? (double)buyVol / (double)sellVol : (double)buyVol;
-   double sl_dist_pts = spread_points * SLToSpread;
-   double tp_dist_pts = spread_points * RewardToSpread;
-   double lot = GetDynamicLot(sl_dist_pts);
+
+   // --- PROFITABILITY FILTERS ---
+   if(PositionsTotal() >= 1) return;
+   if((spread_points / 10.0) > MaxSpread_Pips) return;
+   if(timeSpan > 1000) return; // Only trade if LookbackTicks happened in < 1 second (High Velocity)
+
+   // Dynamic Asymmetric Targets
+   double sl_dist = (spread_points + MinStopBuffer) * point;
+   double tp_dist = sl_dist * RewardRatio; 
+
+   // --- BUY EXECUTION ---
    if(ratio >= OFI_Threshold && momentum > (LookbackTicks/2)) {
-      trade.Buy(lot, _Symbol, curr.ask, curr.ask - (sl_dist_pts * point), curr.ask + (tp_dist_pts * point), "Apex");
-   } else if(ratio <= (1.0 / OFI_Threshold) && momentum < -(LookbackTicks/2)) {
-      trade.Sell(lot, _Symbol, curr.bid, curr.bid + (sl_dist_pts * point), curr.bid - (tp_dist_pts * point), "Apex");
+      double sl = ask - sl_dist; 
+      double tp = ask + tp_dist;
+      if(trade.Buy(LotSize, _Symbol, ask, sl, tp, "ProfitMax Buy"))
+         PrintFormat("Profit Trade: Ratio %.2f | Velocity %.2f", ratio, velocity);
+   }
+   // --- SELL EXECUTION ---
+   else if(ratio <= (1.0 / OFI_Threshold) && momentum < -(LookbackTicks/2)) {
+      double sl = bid + sl_dist;
+      double tp = bid - tp_dist;
+      if(trade.Sell(LotSize, _Symbol, bid, sl, tp, "ProfitMax Sell"))
+         PrintFormat("Profit Trade: Ratio %.2f | Velocity %.2f", ratio, velocity);
    }
 }
-
 EOF
 
 # ============================================
-# 5. ENTRYPOINT WITH AUTO-ATTACH & COMPILE
+# 3. INSTALLATION & ENTRYPOINT
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -109,7 +136,6 @@ MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 wine "$MT5_EXE" &
 sleep 30
 
-# Compile EA
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
 [ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
 mkdir -p "$DATA_DIR/Experts"
