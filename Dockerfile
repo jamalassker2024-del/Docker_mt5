@@ -15,10 +15,10 @@ RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-in
 RUN pip install --no-cache-dir mt5linux rpyc
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# =========================================================
-# V17.1 - CODE REMAINS THE SAME BUT WE FIX FILE PLACEMENT
-# =========================================================
-RUN cat > /root/VALETAX_TICK_BOT_V17.mq5 << 'EOF'
+# ============================================
+# V16 - ULTRA-AGGRESSIVE MOMENTUM TICK BOT
+# ============================================
+RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 #property copyright "Omni-Apex V17.1"
 #property version   "17.10"
@@ -87,10 +87,11 @@ void OnTick() {
       trade.Sell(lot, _Symbol, curr.bid, curr.bid + (sl_dist_pts * point), curr.bid - (tp_dist_pts * point), "Apex");
    }
 }
+
 EOF
 
 # ============================================
-# ENTRYPOINT (CRITICAL PATH FIXES)
+# 5. ENTRYPOINT WITH AUTO-ATTACH & COMPILE
 # ============================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -102,48 +103,21 @@ fluxbox &
 x11vnc -display :1 -forever -shared -nopw -rfbport 5900 &
 websockify --web=/usr/share/novnc 8080 0.0.0.0:5900 &
 wineboot --init
-sleep 10
-
+sleep 5
 MT5_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
-EDITOR_EXE="/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
-
-# 1. Install MT5 if missing
-if [ ! -f "$MT5_EXE" ]; then
-    wine /root/mt5setup.exe /auto
-    sleep 90
-fi
-
-# 2. FORCE-DISCOVER THE CORRECT MQL5 FOLDER
-# MT5 often creates a random hash folder in /root/.wine/drive_c/users/root/AppData/Roaming/MetaQuotes/Terminal/
-MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
-
-if [ -z "$MQL5_DIR" ]; then
-    echo "MQL5 directory not found yet. Starting MT5 once to generate paths..."
-    wine "$MT5_EXE" &
-    sleep 30
-    MQL5_DIR=$(find /root/.wine -type d -name "MQL5" | grep "Terminal" | head -n 1)
-fi
-
-echo "Targeting MQL5 Path: $MQL5_DIR"
-mkdir -p "$MQL5_DIR/Experts/Apex"
-cp /root/VALETAX_TICK_BOT_V17.mq5 "$MQL5_DIR/Experts/Apex/VALETAX_TICK_BOT_V17.mq5"
-
-# 3. Compile via wine
-wine "$EDITOR_EXE" /compile:"$MQL5_DIR/Experts/Apex/VALETAX_TICK_BOT_V17.mq5" /log:"/root/compile.log"
-
-# 4. Start MT5 and MT5-Linux bridge
+[ ! -f "$MT5_EXE" ] && wine /root/mt5setup.exe /auto && sleep 90
 wine "$MT5_EXE" &
-sleep 20
-python3 -m mt5linux --host 0.0.0.0 --port 8001 &
+sleep 30
 
-# 5. KEEP ALIVE LOOP (Prevents server disconnects)
-while true; do
-    # Check if processes are still running, restart bridge if it dies
-    if ! pgrep -f "mt5linux" > /dev/null; then
-        python3 -m mt5linux --host 0.0.0.0 --port 8001 &
-    fi
-    sleep 60
-done
+# Compile EA
+DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
+[ -z "$DATA_DIR" ] && DATA_DIR="/root/.wine/drive_c/Program Files/MetaTrader 5/MQL5"
+mkdir -p "$DATA_DIR/Experts"
+cp /root/VALETAX_TICK_BOT_V16.mq5 "$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5"
+wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/VALETAX_TICK_BOT_V16.mq5" /log:"/root/compile.log"
+
+python3 -m mt5linux --host 0.0.0.0 --port 8001 &
+tail -f /dev/null
 EOF
 
 RUN chmod +x /entrypoint.sh && dos2unix /entrypoint.sh
