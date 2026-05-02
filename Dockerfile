@@ -7,35 +7,33 @@ ENV WINEPREFIX=/root/.wine
 ENV WINEARCH=win64
 ENV WINEDEBUG=-all
 
-# 1. Environment Setup
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
     wine wine64 wine32:i386 winbind xvfb fluxbox x11vnc novnc websockify \
     wget curl procps cabextract unzip dos2unix xdotool \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 2. Python Bridge
 RUN pip install --no-cache-dir mt5linux rpyc
-
-# 3. MT5 Installer
 RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe -O /root/mt5setup.exe
 
-# 4. V15.1 - THE OMNI-APEX (Aggressive Diagnostic Version)
+# ============================================
+# V15.2 - ULTRA-AGGRESSIVE CRYPTO MONITOR
+# ============================================
 RUN cat > /root/OmniApex_v15.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex Global V15.1"
-#property version   "15.10"
+#property copyright "Omni-Apex Global V15.2"
+#property version   "15.20"
 #property strict
 
-//--- AGGRESSIVE INPUTS
-input double InpLotSize       = 0.5;      
-input int    InpTP_Points     = 150;      
-input int    InpSL_Points     = 450;      
-input int    InpMaxOrders     = 30;       
+//--- AGGRESSION SETTINGS FOR CRYPTO
+input double InpLotSize       = 1.0;      // Doubled lot size for aggression
+input int    InpTP_Points     = 1000;     // Increased to clear wide spreads
+input int    InpSL_Points     = 2000;     
+input int    InpMaxOrders     = 50;       
 input int    InpMagic         = 555015;
-input double InpMaxSpreadPips = 10.0;     // Relaxed for Crypto/Weekends
-input int    InpLookback      = 10;       // Shorter lookback for faster entries
-input double InpPressureRatio = 1.01;     // Only 1% imbalance needed
+input double InpMaxSpreadPips = 500.0;    // High enough for BTCUSD.vx spreads
+input int    InpLookback      = 5;        // Ultra-short for instant reaction
+input double InpPressureRatio = 1.001;   // Minimal threshold (0.1% imbalance)
 
 struct SymbolState {
     string name;
@@ -44,7 +42,6 @@ struct SymbolState {
     long sell_v;
     int ticks;
     double point;
-    bool active;
 };
 
 CTrade      trade;
@@ -60,23 +57,17 @@ int OnInit() {
             ArrayResize(monitored, count + 1);
             monitored[count].name   = sym;
             monitored[count].point  = SymbolInfoDouble(sym, SYMBOL_POINT);
-            monitored[count].active = true;
-            monitored[count].ticks  = 0;
             SymbolSelect(sym, true); 
             count++;
         }
     }
-    Print("Omni-Apex V15.1 - Aggressive Mode. Monitoring: ", count, " symbols.");
+    Print("Omni-Apex V15.2 START. Spread Cap: ", InpMaxSpreadPips);
     EventSetMillisecondTimer(50); 
     return(INIT_SUCCEEDED);
 }
 
-void OnDeinit(const int reason) { EventKillTimer(); }
-
 void OnTimer() {
-    for(int i=0; i<ArraySize(monitored); i++) {
-        if(monitored[i].active) RunLogic(monitored[i]);
-    }
+    for(int i=0; i<ArraySize(monitored); i++) RunLogic(monitored[i]);
 }
 
 void RunLogic(SymbolState &state) {
@@ -84,8 +75,8 @@ void RunLogic(SymbolState &state) {
     if(!SymbolInfoTick(state.name, curr_t)) return;
 
     double spread_pips = (curr_t.ask - curr_t.bid) / (state.point * 10);
-    if(spread_pips > InpMaxSpreadPips) return; 
-
+    
+    // OFI CALC
     if(state.prev_t.time_msc == 0) { state.prev_t = curr_t; return; }
     if(curr_t.time_msc == state.prev_t.time_msc) return;
 
@@ -101,25 +92,25 @@ void RunLogic(SymbolState &state) {
         double sP = (double)state.sell_v;
         double ratio = (sP > 0) ? (bP / sP) : bP;
 
-        // DIAGNOSTIC PRINT: Ratio > 1.0 means Buy pressure, Ratio < 1.0 means Sell pressure
-        PrintFormat("[%s] Ratio: %.3f | BuyVol: %.0f | SellVol: %.0f", state.name, ratio, bP, sP);
+        // FORCE PRINT EVERY CYCLE TO DEBUG
+        PrintFormat("[%s] Spread: %.1f | Ratio: %.3f", state.name, spread_pips, ratio);
 
-        int total_pos = 0;
-        for(int j=PositionsTotal()-1; j>=0; j--)
-            if(PositionSelectByTicket(PositionGetTicket(j)) && PositionGetInteger(POSITION_MAGIC) == InpMagic) total_pos++;
+        if(spread_pips <= InpMaxSpreadPips) {
+            int total_pos = 0;
+            for(int j=PositionsTotal()-1; j>=0; j--)
+                if(PositionSelectByTicket(PositionGetTicket(j)) && PositionGetInteger(POSITION_MAGIC) == InpMagic) total_pos++;
 
-        if(total_pos < InpMaxOrders) {
-            uint filling = (uint)SymbolInfoInteger(state.name, SYMBOL_FILLING_MODE);
-            if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
-            else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
-            else trade.SetTypeFilling(ORDER_FILLING_RETURN);
+            if(total_pos < InpMaxOrders) {
+                // Determine Trade Filling
+                uint filling = (uint)SymbolInfoInteger(state.name, SYMBOL_FILLING_MODE);
+                if((filling & SYMBOL_FILLING_FOK) != 0) trade.SetTypeFilling(ORDER_FILLING_FOK);
+                else if((filling & SYMBOL_FILLING_IOC) != 0) trade.SetTypeFilling(ORDER_FILLING_IOC);
+                else trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
-            // BUY if ratio > 1.01, SELL if ratio < 0.99
-            if(ratio >= InpPressureRatio) {
-                trade.Buy(InpLotSize, state.name, curr_t.ask, curr_t.bid - InpSL_Points*state.point, curr_t.ask + InpTP_Points*state.point);
-            }
-            else if(ratio <= (1.0 / InpPressureRatio)) {
-                trade.Sell(InpLotSize, state.name, curr_t.bid, curr_t.ask + InpSL_Points*state.point, curr_t.bid - InpTP_Points*state.point);
+                if(ratio >= InpPressureRatio) 
+                    trade.Buy(InpLotSize, state.name, curr_t.ask, curr_t.bid - InpSL_Points*state.point, curr_t.ask + InpTP_Points*state.point);
+                else if(ratio <= (1.0 / InpPressureRatio)) 
+                    trade.Sell(InpLotSize, state.name, curr_t.bid, curr_t.ask + InpSL_Points*state.point, curr_t.bid - InpTP_Points*state.point);
             }
         }
         state.buy_v = 0; state.sell_v = 0; state.ticks = 0;
@@ -128,7 +119,6 @@ void RunLogic(SymbolState &state) {
 }
 EOF
 
-# 5. Build Script
 RUN cat > /root/install_ea.sh << 'EOF'
 #!/bin/bash
 DATA_DIR=$(find /root/.wine -type d -path "*MetaQuotes/Terminal/*/MQL5" | head -n 1)
@@ -137,9 +127,9 @@ mkdir -p "$DATA_DIR/Experts"
 cp /root/OmniApex_v15.mq5 "$DATA_DIR/Experts/OmniApex_v15.mq5"
 wine "/root/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" /compile:"$DATA_DIR/Experts/OmniApex_v15.mq5" /log:"/root/compile.log"
 EOF
+
 RUN chmod +x /root/install_ea.sh
 
-# 6. Entrypoint
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
