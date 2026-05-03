@@ -20,8 +20,9 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                        MomentumTickFast.mq5     |
-//|                     Mid-price momentum using every bid/ask tick |
+//|                                       BinanceOrderFlowRouter.mq5 |
+//|                                    Purpose: Smart Order Router  |
+//|                                    Based on Binance Order Book  |
 //+------------------------------------------------------------------+
 #property copyright "Omni-Apex"
 #property version   "2.00"
@@ -29,129 +30,283 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 
 #include <Trade\Trade.mqh>
 
-// --- INPUTS --------------------------------------------------------+
-input double   RiskPercent       = 5.0;          // % of equity per trade
-input int      WindowMs          = 2000;         // Rolling window (milliseconds)
-input int      MinNetMomentum    = 1;            // Minimum net momentum to trigger trade
-input int      MaxOpenPositions  = 20;
-input int      MagicNumber       = 999555;
-
-// --- GLOBALS -------------------------------------------------------+
-CTrade trade;
-struct TickRecord {
-   datetime time_ms;
-   int      momentum;     // +1 for mid increase, -1 for mid decrease
-};
-TickRecord buffer[];
-int totalMomentum = 0;
-datetime lastDebug = 0;
-double lastMid = 0;
+//+------------------------------------------------------------------+
+//| Input Parameters                                                 |
+//+------------------------------------------------------------------+
+input string   BinancePair          = "BTCUSDT";              // Symbol on Binance
+input string   userApiKey           = "";                     // Your Binance API Key (optional)
+input double   RiskPerTradePercent  = 2.0;                    // Risk per trade (% of equity)
+input double   OrderBookImbalanceThreshold = 0.65;            // 0-1. >0.65 = buy, <0.35 = sell
+input int      MaxOpenPositions     = 5;                      // Max concurrent trades
+input int      MagicNumber          = 777888;                 // EA magic number
+input int      OrderBookDepth       = 20;                     // Depth to analyze (top N levels)
+input bool     DebugMode            = true;                   // Enable/Disable debug logs
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                           |
+//| Global Variables                                                 |
+//+------------------------------------------------------------------+
+CTrade trade;
+string baseUrlSpot = "https://api.binance.com/api/v3/";
+datetime lastDebugTime = 0;
+datetime lastFetchTime = 0;
+const int fetchIntervalMs = 5000;  // Fetch Binance data every 5 seconds
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   ArrayResize(buffer, 0);
-   // Initialize with current mid
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   lastMid = (ask + bid) / 2.0;
+   SymbolSelect(_Symbol, true);
+   
+   // Check if API key is empty, warn user
+   if(StringLen(userApiKey) == 0) {
+      Print("WARNING: No Binance API Key provided. Using public endpoints only.");
+      Print("For better reliability, please add your Binance API key.");
+   }
+   
    Print("==============================================");
-   Print("🟢 MID-PRICE MOMENTUM EA (Every tick gives signal)");
-   Print("   Window: ", WindowMs, " ms | MinMomentum: ", MinNetMomentum);
-   Print("   Risk: ", RiskPercent, "% | Fast close on profit");
+   Print("🚀 Binance Order Flow Router EA INITIALIZED");
+   Print("   Binance Pair: ", BinancePair);
+   Print("   MT5 Symbol: ", _Symbol);
+   Print("   Imbalance Threshold: ", OrderBookImbalanceThreshold);
+   Print("   Order Book Depth: ", OrderBookDepth, " levels");
+   Print("   Risk Per Trade: ", RiskPerTradePercent, "% of equity");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function                                            |
+//| Helper: WebRequest with better error handling                   |
+//+------------------------------------------------------------------+
+string WebRequestGet(string url) {
+   char post[], result[];
+   string headers;
+   int res = WebRequest("GET", url, NULL, NULL, 5000, post, 0, result, headers);
+   if(res <= 0) {
+      Print("❌ WebRequest failed to: ", url, " Error: ", GetLastError());
+      return "";
+   }
+   return CharArrayToString(result);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Bid-Ask Ratio from Binance Order Book                 |
+//+------------------------------------------------------------------+
+double GetOrderBookImbalance() {
+   string url = baseUrlSpot + "depth?symbol=" + BinancePair + "&limit=" + IntegerToString(OrderBookDepth);
+   string response = WebRequestGet(url);
+   if(response == "") return -1.0;  // Failed
+    
+   // Parse JSON manually (since MQL5 has no native JSON parser)
+   double totalBidVol = 0.0, totalAskVol = 0.0;
+   
+   // Find bids array: "bids":[["price","vol"],...]
+   int bidsPos = StringFind(response, "\"bids\":[");
+   if(bidsPos >= 0) {
+      int startPos = bidsPos + 8; // After "bids":[ 
+      int endPos = StringFind(response, "],", startPos);
+      if(endPos < 0) endPos = StringFind(response, "]]", startPos);
+      if(endPos > startPos) {
+         string bidsStr = StringSubstr(response, startPos, endPos - startPos);
+         // Parse each bid entry ["price","vol"]
+         int searchPos = 0;
+         while(searchPos < StringLen(bidsStr)) {
+            int volStart = StringFind(bidsStr, ",\"", searchPos);
+            if(volStart < 0) break;
+            volStart += 2;  // Skip past ',"'
+            int volEnd = StringFind(bidsStr, "\"", volStart);
+            if(volEnd > volStart) {
+               double vol = StringToDouble(StringSubstr(bidsStr, volStart, volEnd - volStart));
+               totalBidVol += vol;
+            }
+            searchPos = volEnd + 1;
+         }
+      }
+   }
+   
+   // Find asks array: "asks":[["price","vol"],...]
+   int asksPos = StringFind(response, "\"asks\":[");
+   if(asksPos >= 0) {
+      int startPos = asksPos + 8; // After "asks":[ 
+      int endPos = StringFind(response, "]]", startPos);
+      if(endPos > startPos) {
+         string asksStr = StringSubstr(response, startPos, endPos - startPos);
+         int searchPos = 0;
+         while(searchPos < StringLen(asksStr)) {
+            int volStart = StringFind(asksStr, ",\"", searchPos);
+            if(volStart < 0) break;
+            volStart += 2;
+            int volEnd = StringFind(asksStr, "\"", volStart);
+            if(volEnd > volStart) {
+               double vol = StringToDouble(StringSubstr(asksStr, volStart, volEnd - volStart));
+               totalAskVol += vol;
+            }
+            searchPos = volEnd + 1;
+         }
+      }
+   }
+   
+   // Apply ratio formula: totalBidVol / (totalBidVol + totalAskVol)
+   if(totalBidVol + totalAskVol == 0) return -1.0;
+   double ratio = totalBidVol / (totalBidVol + totalAskVol);
+   
+   if(DebugMode && TimeCurrent() - lastDebugTime >= 5) {
+      Print("📊 [Book] BidVol: ", DoubleToString(totalBidVol, 2), 
+            " AskVol: ", DoubleToString(totalAskVol, 2),
+            " Ratio: ", DoubleToString(ratio, 3));
+   }
+   return ratio;
+}
+
+//+------------------------------------------------------------------+
+//| Get Trade Flow Imbalance (Aggressor from recent trades)         |
+//| Returns positive for buying pressure, negative for selling      |
+//+------------------------------------------------------------------+
+double GetTradeFlowImbalance() {
+   string url = baseUrlSpot + "trades?symbol=" + BinancePair + "&limit=50";
+   string response = WebRequestGet(url);
+   if(response == "") return 0.0;
+   
+   double buyVol = 0.0, sellVol = 0.0;
+   
+   // Parse trade array, look for "isBuyerMaker":true/false
+   // If isBuyerMaker is false → aggressive buy (taker bought from maker)
+   // If isBuyerMaker is true → aggressive sell (taker sold to maker)
+   int searchPos = 0;
+   while(true) {
+      int makerPos = StringFind(response, "\"isBuyerMaker\":", searchPos);
+      if(makerPos < 0) break;
+      int valueStart = makerPos + 16;
+      int valueEnd = (StringFind(response, ",\"", valueStart) < 0) ? 
+                     StringFind(response, "}", valueStart) : 
+                     StringFind(response, ",\"", valueStart);
+      if(valueEnd < 0) break;
+      string isMaker = StringSubstr(response, valueStart, valueEnd - valueStart);
+      
+      // Find volume for this trade
+      int volPos = StringFind(response, "\"quoteQty\":", searchPos);
+      if(volPos < 0) break;
+      int volStart = volPos + 11;
+      int volEnd = StringFind(response, ",\"", volStart);
+      if(volEnd < 0) volEnd = StringFind(response, "}", volStart);
+      if(volEnd < 0) break;
+      double vol = StringToDouble(StringSubstr(response, volStart, volEnd - volStart));
+      
+      if(isMaker == "false") buyVol += vol;   // Aggressive buy
+      else if(isMaker == "true") sellVol += vol;   // Aggressive sell
+      
+      searchPos = volEnd + 1;
+   }
+   
+   double totalVol = buyVol + sellVol;
+   if(totalVol == 0) return 0.0;
+   double netImbalance = (buyVol - sellVol) / totalVol;  // Range -1 to +1
+   
+   if(DebugMode && TimeCurrent() - lastDebugTime >= 5) {
+      Print("📊 [Trades] BuyVol: ", DoubleToString(buyVol, 2), 
+            " SellVol: ", DoubleToString(sellVol, 2),
+            " Net Imbalance: ", DoubleToString(netImbalance, 3));
+   }
+   return netImbalance;
+}
+
+//+------------------------------------------------------------------+
+//| Main Expert Tick Function                                        |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // 1. Close any profitable position immediately
+   // 1. Close any position with profit > 0 (Fast Out)
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
       if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
          double profit = PositionGetDouble(POSITION_PROFIT);
          if(profit > 0.0) {
-            if(trade.PositionClose(ticket))
-               Print("✅ [CLOSE] Ticket ", ticket, " profit: ", profit);
-            else
-               Print("❌ [CLOSE] Error: ", GetLastError());
+            if(trade.PositionClose(ticket)) {
+               Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
+            } else {
+               Print("❌ [CLOSE] Failed to close ticket ", ticket);
+            }
          }
       }
    }
    
-   if(PositionsTotal() >= MaxOpenPositions) return;
+   // 2. Position limit check
+   if(PositionsTotal() >= MaxOpenPositions) {
+      if(DebugMode && TimeCurrent() - lastDebugTime >= 30) {
+         Print("⚠️ Max positions reached: ", PositionsTotal());
+      }
+      return;
+   }
    
-   // 2. Get current prices and compute mid
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(ask <= 0 || bid <= 0) return;
-   double currentMid = (ask + bid) / 2.0;
+   // 3. Fetch Binance data at intervals (not every tick to avoid rate limits)
+   if(TimeCurrent() * 1000 - lastFetchTime < fetchIntervalMs) return;
+   lastFetchTime = TimeCurrent() * 1000;
    
-   // 3. Determine momentum direction
-   int momentum = 0;
-   if(currentMid > lastMid) momentum = 1;
-   else if(currentMid < lastMid) momentum = -1;
-   else momentum = 0;   // no change, ignore
+   // 4. Get both signals
+   double bookImbalance = GetOrderBookImbalance();      // Ratio 0-1
+   double tradeFlow = GetTradeFlowImbalance();          // Net -1 to +1
    
-   if(momentum != 0) {
-      MqlTick tick;
-      SymbolInfoTick(_Symbol, tick);
-      TickRecord rec;
-      rec.time_ms = tick.time_msc;
-      rec.momentum = momentum;
-      ArrayResize(buffer, ArraySize(buffer)+1);
-      buffer[ArraySize(buffer)-1] = rec;
-      totalMomentum += momentum;
+   if(bookImbalance < 0) {
+      Print("❌ Failed to fetch Binance order book data");
+      return;
+   }
+   
+   // 5. Determine signal direction
+   bool buySignal = false;
+   bool sellSignal = false;
+   string signalStrength = "none";
+   
+   // Strong buy: Book ratio > threshold AND trade flow positive
+   if(bookImbalance >= OrderBookImbalanceThreshold && tradeFlow > 0.2) {
+      buySignal = true;
+      signalStrength = "STRONG BUY";
+   }
+   // Strong sell: Book ratio < (1 - threshold) AND trade flow negative
+   else if(bookImbalance <= (1.0 - OrderBookImbalanceThreshold) && tradeFlow < -0.2) {
+      sellSignal = true;
+      signalStrength = "STRONG SELL";
+   }
+   // Medium signal: Only one condition met
+   else if(bookImbalance >= OrderBookImbalanceThreshold && tradeFlow <= 0.2) {
+      buySignal = true;
+      signalStrength = "WEAK BUY (book only)";
+   }
+   else if(bookImbalance <= (1.0 - OrderBookImbalanceThreshold) && tradeFlow >= -0.2) {
+      sellSignal = true;
+      signalStrength = "WEAK SELL (book only)";
+   }
+   
+   // 6. Debug output
+   if(DebugMode) {
+      Print("========================================");
+      Print("📊 SIGNAL ANALYSIS:");
+      Print("   Book Ratio: ", DoubleToString(bookImbalance, 3));
+      Print("   Trade Flow: ", DoubleToString(tradeFlow, 3));
+      Print("   Signal: ", signalStrength);
+      Print("========================================");
+   }
+   
+   // 7. Execute trade based on signal
+   if(buySignal || sellSignal) {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPerTradePercent / 100.0), 2);
+      lot = MathMax(0.01, lot);
       
-      // Remove old records
-      datetime cutoff = tick.time_msc - WindowMs;
-      int removeCount = 0;
-      for(int j = 0; j < ArraySize(buffer); j++) {
-         if(buffer[j].time_ms < cutoff) {
-            totalMomentum -= buffer[j].momentum;
-            removeCount++;
-         } else break;
+      if(buySignal) {
+         if(trade.Buy(lot, _Symbol, ask, 0, 0, "Binance Flow Buy")) {
+            Print("🔥 [BUY OPEN] Signal: ", signalStrength, " | Lot: ", lot, " @ ", ask);
+         } else {
+            Print("❌ [BUY FAIL] Error: ", GetLastError());
+         }
       }
-      if(removeCount > 0) {
-         int newSize = ArraySize(buffer) - removeCount;
-         for(int j = 0; j < newSize; j++)
-            buffer[j] = buffer[j+removeCount];
-         ArrayResize(buffer, newSize);
+      else if(sellSignal) {
+         if(trade.Sell(lot, _Symbol, bid, 0, 0, "Binance Flow Sell")) {
+            Print("🔥 [SELL OPEN] Signal: ", signalStrength, " | Lot: ", lot, " @ ", bid);
+         } else {
+            Print("❌ [SELL FAIL] Error: ", GetLastError());
+         }
       }
-   }
-   lastMid = currentMid;
-   
-   // 4. Debug every 3 seconds
-   if(TimeCurrent() - lastDebug >= 3) {
-      lastDebug = TimeCurrent();
-      Print("========================================");
-      Print("📊 Net Momentum (", WindowMs, "ms): ", totalMomentum);
-      Print("   Threshold: ±", MinNetMomentum, " | Positions: ", PositionsTotal());
-      Print("   Buffer size: ", ArraySize(buffer));
-      Print("   Mid: ", DoubleToString(currentMid, _Digits));
-      Print("========================================");
-   }
-   
-   // 5. Trade signals
-   double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
-   lot = MathMax(0.01, lot);
-   
-   if(totalMomentum >= MinNetMomentum) {
-      if(trade.Buy(lot, _Symbol, ask, 0, 0, "Momentum Buy"))
-         Print("🔥 [BUY] NetMomentum = ", totalMomentum);
-      else
-         Print("❌ [BUY FAIL] Error: ", GetLastError());
-   }
-   else if(totalMomentum <= -MinNetMomentum) {
-      if(trade.Sell(lot, _Symbol, bid, 0, 0, "Momentum Sell"))
-         Print("🔥 [SELL] NetMomentum = ", totalMomentum);
-      else
-         Print("❌ [SELL FAIL] Error: ", GetLastError());
    }
 }
 EOF
