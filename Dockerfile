@@ -20,417 +20,268 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                                Aggressive_Scalper |
-//|                                                                  |
-//|                     High Win Rate Scalping EA for MT5            |
-//|                                    Weighted Signal Scoring System|
+//|                                        Aggressive_Scalper_200usd |
+//|                                           Target: $200/day on $1k|
+//|                                                   High Win Rate  |
 //+------------------------------------------------------------------+
-#property copyright "Aggressive Scalper"
-#property version   "1.00"
+#property copyright "Scalper Pro"
+#property version   "2.00"
 #property strict
 
-// --- Input Parameters (Tweak these to adjust aggression) ---
-input string   t1 = "====== Trade Settings ======";
-input double   RiskPercent        = 1.0;        // Risk per trade (% of equity)
-input int      StopLossPoints     = 120;        // Stop Loss (in points = pips*10)
-input int      TakeProfitPoints   = 80;         // Take Profit (in points)
-input int      MaxConcurrentTrades = 2;         // Max positions at once
-input int      MagicNumber        = 20260505;   // Unique EA identifier
+// --- Inputs (Configure for maximum aggression) ---
+input string   t1 = "==== Risk & Money ====";
+input double   RiskPercent       = 5.0;        // Risk per trade (% of equity)
+input int      StopLossPoints    = 120;        // Stop Loss in points (12 pips for 5-digit broker)
+input int      TakeProfitPoints  = 60;         // Take Profit in points (6 pips)
+input int      MaxConcurrentTrades = 3;        // Max positions at once
+input int      MagicNumber       = 20260505;
 
-input string   t2 = "====== Entry Filters ======";
-input int      SignalThreshold    = 75;         // Min signal score (0-100, 70+ = aggressive)
-input int      FastMAPeriod       = 9;          // Fast EMA period
-input int      SlowMAPeriod       = 21;         // Slow EMA period
-input int      RsiPeriod          = 14;         // RSI period
-input int      RsiBuyThreshold    = 35;         // RSI below this to consider buy
-input int      RsiSellThreshold   = 65;         // RSI above this to consider sell
-input int      AtrPeriod          = 14;         // ATR period for volatility filter
-input double   MinATRMultiplier   = 0.8;        // Min ATR percentage to avoid choppy markets
+input string   t2 = "==== Entry Filters ====";
+input int      RsiPeriod         = 6;          // Fast RSI for scalping
+input int      RsiOversold       = 25;         // Buy when RSI < 25
+input int      RsiOverbought     = 75;         // Sell when RSI > 75
+input double   MinATRMultiplier  = 0.5;        // Minimum ATR (avoid chop)
+input int      ATRPeriod         = 14;
 
-input string   t3 = "====== Risk Management ======";
-input double   MaxDailyLossPercent = 5.0;       // Max daily drawdown before halt
-input bool     UseTrailingStop    = true;       // Enable trailing stop
-input int      TrailingStartPoints = 30;        // Trailing activates at this profit (points)
-input int      TrailingStepPoints = 10;         // Trailing stop step (points)
+input string   t3 = "==== Risk Management ====";
+input double   DailyTargetUSD    = 200.0;      // Stop trading after $200 profit (optional)
+input double   MaxDailyLossUSD   = 100.0;      // Stop after $100 loss
+input int      MaxSpreadPoints   = 20;         // Max spread in points (2 pips)
+input bool     UseTrailingStop   = true;
+input int      TrailingStartPts  = 50;         // Activate at 5 pips profit
+input int      TrailingStepPts   = 30;         // Step 3 pips
 
-// --- Global Variables ---
-double   RsiBuffer[];
-double   AtrBuffer[];
-double   FastEMABuffer[];
-double   SlowEMABuffer[];
-int      RsiHandle, AtrHandle, FastEMAHandle, SlowEMAHandle;
-double   dailyLoss = 0.0;
+// --- Globals ---
+CTrade trade;
+int rsi_handle, atr_handle;
+double rsi_buf[], atr_buf[];
 datetime lastBarTime = 0;
-bool     tradingHalted = false;
+double dailyProfit = 0.0;
+double startingEquity = 0.0;
+bool tradingHalted = false;
 
 //+------------------------------------------------------------------+
-//| Expert initialization function                                   |
+//| Expert initialization                                           |
 //+------------------------------------------------------------------+
-int OnInit()
-{
-   // Initialize indicator handles
-   RsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RsiPeriod, PRICE_CLOSE);
-   AtrHandle = iATR(_Symbol, PERIOD_CURRENT, AtrPeriod);
-   FastEMAHandle = iMA(_Symbol, PERIOD_CURRENT, FastMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
-   SlowEMAHandle = iMA(_Symbol, PERIOD_CURRENT, SlowMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+int OnInit() {
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetTypeFilling(ORDER_FILLING_FOK);
    
-   if(RsiHandle == INVALID_HANDLE || AtrHandle == INVALID_HANDLE ||
-      FastEMAHandle == INVALID_HANDLE || SlowEMAHandle == INVALID_HANDLE)
-   {
-      Print("Error creating indicator handles");
-      return(INIT_FAILED);
+   // Indicator handles
+   rsi_handle = iRSI(_Symbol, PERIOD_CURRENT, RsiPeriod, PRICE_CLOSE);
+   atr_handle = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+   if(rsi_handle == INVALID_HANDLE || atr_handle == INVALID_HANDLE) {
+      Print("Error creating indicators");
+      return INIT_FAILED;
    }
    
-   ArraySetAsSeries(RsiBuffer, true);
-   ArraySetAsSeries(AtrBuffer, true);
-   ArraySetAsSeries(FastEMABuffer, true);
-   ArraySetAsSeries(SlowEMABuffer, true);
+   ArraySetAsSeries(rsi_buf, true);
+   ArraySetAsSeries(atr_buf, true);
    
-   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   startingEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    tradingHalted = false;
    
-   Print("✓ Aggressive Scalper EA initialized on ", _Symbol);
-   Print("✓ Signal Threshold: ", SignalThreshold, " | Risk: ", RiskPercent, "% per trade");
+   Print("==========================================");
+   Print("🚀 AGGRESSIVE SCALPER ACTIVE");
+   Print("   Risk per trade: ", RiskPercent, "%");
+   Print("   TP: ", TakeProfitPoints/10.0, " pips | SL: ", StopLossPoints/10.0, " pips");
+   Print("   Daily Target: $", DailyTargetUSD, " | Max Loss: $", MaxDailyLossUSD);
+   Print("   Target return: $200/day on $1000 = 20% daily (HIGH RISK)");
+   Print("==========================================");
    
-   return(INIT_SUCCEEDED);
+   return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
+//| Deinitialization                                               |
 //+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-{
-   // Release indicator handles
-   IndicatorRelease(RsiHandle);
-   IndicatorRelease(AtrHandle);
-   IndicatorRelease(FastEMAHandle);
-   IndicatorRelease(SlowEMAHandle);
-   
-   Print("EA deinitialized. Reason: ", reason);
+void OnDeinit(const int reason) {
+   IndicatorRelease(rsi_handle);
+   IndicatorRelease(atr_handle);
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick function (main trading logic)                        |
+//| Main tick function (fast scalping)                              |
 //+------------------------------------------------------------------+
-void OnTick()
-{
-   // 1. Check if trading is halted due to daily loss limit
-   if(tradingHalted)
-   {
-      if(CalculateDailyLoss() < MaxDailyLossPercent)
-         tradingHalted = false;
-      else
-         return;
-   }
+void OnTick() {
+   // --- Daily profit/loss tracking ---
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   dailyProfit = currentEquity - startingEquity;
    
-   // 2. Update daily loss tracking
-   double dailyLossPercent = CalculateDailyLoss();
-   if(dailyLossPercent >= MaxDailyLossPercent) 
-   {
+   if(dailyProfit >= DailyTargetUSD) {
+      if(!tradingHalted) Print("🎯 Daily target reached: $", dailyProfit, " - Trading halted");
       tradingHalted = true;
-      Print("Daily loss limit reached (", dailyLossPercent, "%). Trading halted.");
+      return;
+   }
+   if(dailyProfit <= -MaxDailyLossUSD) {
+      if(!tradingHalted) Print("💀 Daily loss limit reached: $", dailyProfit, " - Trading halted");
+      tradingHalted = true;
+      return;
+   }
+   if(tradingHalted) {
+      // Reset at midnight (broker time)
+      static datetime lastMidnight = 0;
+      datetime now = TimeCurrent();
+      MqlDateTime dt;
+      TimeToStruct(now, dt);
+      dt.hour = 0; dt.min = 0; dt.sec = 0;
+      datetime midnight = StructToTime(dt);
+      if(midnight != lastMidnight) {
+         lastMidnight = midnight;
+         tradingHalted = false;
+         startingEquity = currentEquity;
+         Print("🔄 New day - Trading resumed");
+      }
       return;
    }
    
-   // 3. Check for new bar (only trade at bar close to reduce noise)
-   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
-   if(currentBarTime == lastBarTime) return;
-   lastBarTime = currentBarTime;
+   // --- Spread check ---
+   double spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   if(spread > MaxSpreadPoints) return;
    
-   // 4. Refresh indicator values
-   CopyBuffer(RsiHandle, 0, 0, 3, RsiBuffer);
-   CopyBuffer(AtrHandle, 0, 0, 3, AtrBuffer);
-   CopyBuffer(FastEMAHandle, 0, 0, 3, FastEMABuffer);
-   CopyBuffer(SlowEMAHandle, 0, 0, 3, SlowEMABuffer);
+   // --- Update indicators (every tick) ---
+   CopyBuffer(rsi_handle, 0, 0, 3, rsi_buf);
+   CopyBuffer(atr_handle, 0, 0, 3, atr_buf);
+   double rsi = rsi_buf[0];
+   double atr = atr_buf[0];
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double atrPips = atr / point / 10.0;
    
-   double currentRsi = RsiBuffer[0];
-   double currentAtr = AtrBuffer[0];
-   double fastEMA = FastEMABuffer[0];
-   double slowEMA = SlowEMABuffer[0];
-   double prevFastEMA = FastEMABuffer[1];
-   double prevSlowEMA = SlowEMABuffer[1];
+   // Skip if volatility too low
+   if(atrPips < MinATRMultiplier) return;
    
-   // 5. Count open positions for this symbol
-   int posCount = CountOpenPositions();
+   // --- Count open positions ---
+   int posCount = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
+      if(PositionSelectByTicket(PositionGetTicket(i))) {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber) posCount++;
+      }
+   }
    if(posCount >= MaxConcurrentTrades) return;
    
-   // 6. Calculate signal scores
-   double buyScore = CalculateBuyScore(currentRsi, fastEMA, slowEMA, prevFastEMA, prevSlowEMA, currentAtr);
-   double sellScore = CalculateSellScore(currentRsi, fastEMA, slowEMA, prevFastEMA, prevSlowEMA, currentAtr);
+   // --- Detect engulfing patterns (price action) ---
+   bool bullishEngulf = IsBullishEngulfing();
+   bool bearishEngulf = IsBearishEngulfing();
    
-   // 7. Execute trades if threshold met
-   if(buyScore >= SignalThreshold)
-      ExecuteTrade(ORDER_TYPE_BUY);
-   else if(sellScore >= SignalThreshold)
-      ExecuteTrade(ORDER_TYPE_SELL);
-}
-
-//+------------------------------------------------------------------+
-//| Calculate buy signal score (0-100)                               |
-//+------------------------------------------------------------------+
-double CalculateBuyScore(double rsi, double fastEMA, double slowEMA, 
-                          double prevFast, double prevSlow, double atr)
-{
-   double score = 0.0;
+   // --- Signal logic ---
+   bool buySignal = (rsi < RsiOversold && bullishEngulf) || (rsi < RsiOversold-5);
+   bool sellSignal = (rsi > RsiOverbought && bearishEngulf) || (rsi > RsiOverbought+5);
    
-   // Trend factor: EMA alignment (max 35 points)
-   if(fastEMA > slowEMA)
-      score += 25;
-   // EMA just crossed up?
-   if(prevFast <= prevSlow && fastEMA > slowEMA)
-      score += 10;
+   // --- Apply trailing stop to existing positions (fast exit)---
+   if(UseTrailingStop) ApplyTrailingStop();
+   
+   // --- Execute trades ---
+   if(buySignal && posCount == 0) {  // Only enter if no positions to avoid overloading
+      double lot = CalculateLotSize(ORDER_TYPE_BUY);
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double sl = ask - StopLossPoints * point;
+      double tp = ask + TakeProfitPoints * point;
+      sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+      tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
       
-   // Momentum factor: RSI condition (max 30 points)
-   if(rsi < RsiBuyThreshold)
-      score += 30;
-   else if(rsi < RsiBuyThreshold + 10)
-      score += 15;
-   else if(rsi < RsiBuyThreshold + 20)
-      score += 5;
-   
-   // Volatility factor: ATR validation (max 20 points)
-   double normalizedATR = atr / _Point / 10;  // ATR in pips approx
-   if(normalizedATR > MinATRMultiplier * 5)   // enough movement
-      score += 20;
-   else if(normalizedATR > MinATRMultiplier * 3)
-      score += 10;
-      
-   // Price action / impulse detection (max 15 points)
-   double close = iClose(_Symbol, PERIOD_CURRENT, 0);
-   double open = iOpen(_Symbol, PERIOD_CURRENT, 0);
-   double body = close - open;
-   if(body > 0 && body > (iHigh(_Symbol, PERIOD_CURRENT, 0) - iLow(_Symbol, PERIOD_CURRENT, 0)) * 0.6)
-      score += 15;
-   else if(body > 0)
-      score += 8;
-   
-   return score;
-}
-
-//+------------------------------------------------------------------+
-//| Calculate sell signal score (0-100)                              |
-//+------------------------------------------------------------------+
-double CalculateSellScore(double rsi, double fastEMA, double slowEMA,
-                           double prevFast, double prevSlow, double atr)
-{
-   double score = 0.0;
-   
-   // Trend factor: EMA alignment (max 35 points)
-   if(fastEMA < slowEMA)
-      score += 25;
-   if(prevFast >= prevSlow && fastEMA < slowEMA)
-      score += 10;
-      
-   // Momentum factor: RSI condition (max 30 points)
-   if(rsi > RsiSellThreshold)
-      score += 30;
-   else if(rsi > RsiSellThreshold - 10)
-      score += 15;
-   else if(rsi > RsiSellThreshold - 20)
-      score += 5;
-   
-   // Volatility factor: ATR validation (max 20 points)
-   double normalizedATR = atr / _Point / 10;
-   if(normalizedATR > MinATRMultiplier * 5)
-      score += 20;
-   else if(normalizedATR > MinATRMultiplier * 3)
-      score += 10;
-      
-   // Price action: bearish impulse detection (max 15 points)
-   double close = iClose(_Symbol, PERIOD_CURRENT, 0);
-   double open = iOpen(_Symbol, PERIOD_CURRENT, 0);
-   double body = close - open;
-   if(body < 0 && -body > (iHigh(_Symbol, PERIOD_CURRENT, 0) - iLow(_Symbol, PERIOD_CURRENT, 0)) * 0.6)
-      score += 15;
-   else if(body < 0)
-      score += 8;
-   
-   return score;
-}
-
-//+------------------------------------------------------------------+
-//| Execute a market order                                           |
-//+------------------------------------------------------------------+
-void ExecuteTrade(int orderType)
-{
-   MqlTradeRequest request = {};
-   MqlTradeResult  result = {};
-   
-   double price = (orderType == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) 
-                                                 : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double sl = 0, tp = 0;
-   
-   // Calculate stop loss and take profit
-   if(orderType == ORDER_TYPE_BUY)
-   {
-      sl = price - StopLossPoints * _Point;
-      tp = price + TakeProfitPoints * _Point;
-   }
-   else // SELL
-   {
-      sl = price + StopLossPoints * _Point;
-      tp = price - TakeProfitPoints * _Point;
-   }
-   
-   // Normalize SL/TP to broker requirements
-   sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-   tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-   
-   // Calculate lot size based on risk percentage
-   double lotSize = CalculateLotSize(orderType, sl, price);
-   if(lotSize <= 0) return;
-   
-   // Prepare and send order
-   request.action     = TRADE_ACTION_DEAL;
-   request.symbol     = _Symbol;
-   request.volume     = lotSize;
-   request.type       = orderType;
-   request.price      = price;
-   request.sl         = sl;
-   request.tp         = tp;
-   request.deviation  = 10;
-   request.magic      = MagicNumber;
-   request.comment    = "Aggressive Scalper";
-   request.type_filling = ORDER_FILLING_FOK;
-   request.type_time  = ORDER_TIME_GTC;
-   
-   if(OrderSend(request, result))
-   {
-      if(result.retcode == TRADE_RETCODE_DONE)
-      {
-         Print("✓ ORDER EXECUTED | Type: ", (orderType == ORDER_TYPE_BUY ? "BUY" : "SELL"),
-               " | Lots: ", lotSize, " | Price: ", price,
-               " | SL: ", sl, " | TP: ", tp,
-               " | Ticket: ", result.order);
+      if(trade.Buy(lot, _Symbol, ask, sl, tp, "AggScalp BUY")) {
+         Print("🔥 BUY | RSI=", rsi, " | Lot=", lot, " | TP=", tp, " | SL=", sl);
       }
-      else
-         Print("✗ Order failed | Error: ", result.retcode, " - ", GetLastError());
    }
-   else
-      Print("✗ Order send error: ", GetLastError());
+   else if(sellSignal && posCount == 0) {
+      double lot = CalculateLotSize(ORDER_TYPE_SELL);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double sl = bid + StopLossPoints * point;
+      double tp = bid - TakeProfitPoints * point;
+      sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+      tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+      
+      if(trade.Sell(lot, _Symbol, bid, sl, tp, "AggScalp SELL")) {
+         Print("🔥 SELL | RSI=", rsi, " | Lot=", lot, " | TP=", tp, " | SL=", sl);
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size based on risk percentage                      |
+//| Detect Bullish Engulfing (current candle closes above previous high) |
 //+------------------------------------------------------------------+
-double CalculateLotSize(int orderType, double slPrice, double entryPrice)
-{
-   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double stopDistance = MathAbs(entryPrice - slPrice);
-   double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double stopInPoints = stopDistance / pointValue;
+bool IsBullishEngulfing() {
+   double close0 = iClose(_Symbol, PERIOD_CURRENT, 0);
+   double open0 = iOpen(_Symbol, PERIOD_CURRENT, 0);
+   double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double open1 = iOpen(_Symbol, PERIOD_CURRENT, 1);
    
-   double lotSize = riskAmount / (stopInPoints * tickValue);
+   if(close0 > open0 && close1 < open1) {   // current bullish, previous bearish
+      if(close0 > open1 && open0 < close1) // engulfing condition
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Detect Bearish Engulfing                                          |
+//+------------------------------------------------------------------+
+bool IsBearishEngulfing() {
+   double close0 = iClose(_Symbol, PERIOD_CURRENT, 0);
+   double open0 = iOpen(_Symbol, PERIOD_CURRENT, 0);
+   double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double open1 = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   
+   if(close0 < open0 && close1 > open1) {   // current bearish, previous bullish
+      if(close0 < open1 && open0 > close1) // engulfing
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on risk percent                         |
+//+------------------------------------------------------------------+
+double CalculateLotSize(int orderType) {
+   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double stopDistPoints = StopLossPoints;
+   double stopLossValue = stopDistPoints * tickValue;
+   double lot = riskAmount / stopLossValue;
+   
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   
-   lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
-   lotSize = MathRound(lotSize / stepLot) * stepLot;
-   
-   return lotSize;
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathRound(lot / stepLot) * stepLot;
+   return lot;
 }
 
 //+------------------------------------------------------------------+
-//| Count open positions for this symbol and magic number            |
+//| Apply trailing stop to all open positions                        |
 //+------------------------------------------------------------------+
-int CountOpenPositions()
-{
-   int count = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      if(PositionSelectByTicket(PositionGetTicket(i)))
-      {
-         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
-            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-            count++;
-      }
-   }
-   return count;
-}
-
-//+------------------------------------------------------------------+
-//| Calculate daily loss percentage from peak equity                |
-//+------------------------------------------------------------------+
-double CalculateDailyLoss()
-{
-   static double peakEquityToday = 0;
-   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   
-   datetime currentTime = TimeCurrent();
-   MqlDateTime dt;
-   TimeToStruct(currentTime, dt);
-   dt.hour = 0; dt.min = 0; dt.sec = 0;
-   datetime midnight = StructToTime(dt);
-   
-   static datetime lastMidnight = 0;
-   if(lastMidnight != midnight)
-   {
-      peakEquityToday = currentEquity;
-      lastMidnight = midnight;
-   }
-   
-   if(currentEquity > peakEquityToday)
-      peakEquityToday = currentEquity;
-      
-   if(peakEquityToday == 0)
-      return 0;
-      
-   double drawdownPercent = (peakEquityToday - currentEquity) / peakEquityToday * 100.0;
-   return drawdownPercent;
-}
-
-//+------------------------------------------------------------------+
-//| Apply trailing stop to existing positions (called in OnTick)    |
-//+------------------------------------------------------------------+
-void ApplyTrailingStop()
-{
-   if(!UseTrailingStop) return;
-   
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
+void ApplyTrailingStop() {
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket))
-      {
-         if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
-            PositionGetInteger(POSITION_MAGIC) != MagicNumber)
-            continue;
-            
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
          double currentSL = PositionGetDouble(POSITION_SL);
-         double currentTP = PositionGetDouble(POSITION_TP);
          double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-         double currentPrice = PositionGetDouble(POSITION_TYPE) == POSITION_TYPE_BUY ? 
-                               SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+         double currentPrice = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ?
+                               SymbolInfoDouble(_Symbol, SYMBOL_BID) :
                                SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          double profitPoints = (currentPrice - openPrice) / _Point;
-         if(PositionGetDouble(POSITION_TYPE) == POSITION_TYPE_SELL)
+         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
             profitPoints = -profitPoints;
-            
-         if(profitPoints >= TrailingStartPoints)
-         {
+         
+         if(profitPoints >= TrailingStartPts) {
             double newSL = 0;
-            if(PositionGetDouble(POSITION_TYPE) == POSITION_TYPE_BUY)
-               newSL = currentPrice - TrailingStepPoints * _Point;
-            else
-               newSL = currentPrice + TrailingStepPoints * _Point;
-               
-            if(newSL > currentSL)
-            {
-               MqlTradeRequest req = {};
-               MqlTradeResult res = {};
-               req.action = TRADE_ACTION_SLTP;
-               req.symbol = _Symbol;
-               req.position = ticket;
-               req.sl = newSL;
-               req.tp = currentTP;
-               req.magic = MagicNumber;
-               OrderSend(req, res);
+            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
+               newSL = currentPrice - TrailingStepPts * _Point;
+               if(newSL > currentSL) {
+                  trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+               }
+            } else {
+               newSL = currentPrice + TrailingStepPts * _Point;
+               if(newSL < currentSL || currentSL == 0) {
+                  trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+               }
             }
          }
       }
    }
 }
+//+------------------------------------------------------------------+
 EOF
 
 # ============================================
