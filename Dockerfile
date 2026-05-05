@@ -20,291 +20,413 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                       BinanceOrderFlowRouter.mq5 |
-//|                                    Purpose: Smart Order Router  |
-//|                                    Based on Binance Order Book  |
+//|                                                Aggressive_Scalper |
+//|                                                                  |
+//|                     High Win Rate Scalping EA for MT5            |
+//|                                    Weighted Signal Scoring System|
 //+------------------------------------------------------------------+
-#property copyright "Omni-Apex"
-#property version   "2.00"
+#property copyright "Aggressive Scalper"
+#property version   "1.00"
 #property strict
 
-#include <Trade\Trade.mqh>
+// --- Input Parameters (Tweak these to adjust aggression) ---
+input string   t1 = "====== Trade Settings ======";
+input double   RiskPercent        = 1.0;        // Risk per trade (% of equity)
+input int      StopLossPoints     = 120;        // Stop Loss (in points = pips*10)
+input int      TakeProfitPoints   = 80;         // Take Profit (in points)
+input int      MaxConcurrentTrades = 2;         // Max positions at once
+input int      MagicNumber        = 20260505;   // Unique EA identifier
 
-//+------------------------------------------------------------------+
-//| Input Parameters                                                 |
-//+------------------------------------------------------------------+
-input string   BinancePair          = "BTCUSDT";              // Symbol on Binance
-input string   userApiKey           = "";                     // Your Binance API Key (optional)
-input double   RiskPerTradePercent  = 2.0;                    // Risk per trade (% of equity)
-input double   OrderBookImbalanceThreshold = 0.65;            // 0-1. >0.65 = buy, <0.35 = sell
-input int      MaxOpenPositions     = 5;                      // Max concurrent trades
-input int      MagicNumber          = 777888;                 // EA magic number
-input int      OrderBookDepth       = 20;                     // Depth to analyze (top N levels)
-input bool     DebugMode            = true;                   // Enable/Disable debug logs
+input string   t2 = "====== Entry Filters ======";
+input int      SignalThreshold    = 75;         // Min signal score (0-100, 70+ = aggressive)
+input int      FastMAPeriod       = 9;          // Fast EMA period
+input int      SlowMAPeriod       = 21;         // Slow EMA period
+input int      RsiPeriod          = 14;         // RSI period
+input int      RsiBuyThreshold    = 35;         // RSI below this to consider buy
+input int      RsiSellThreshold   = 65;         // RSI above this to consider sell
+input int      AtrPeriod          = 14;         // ATR period for volatility filter
+input double   MinATRMultiplier   = 0.8;        // Min ATR percentage to avoid choppy markets
 
-//+------------------------------------------------------------------+
-//| Global Variables                                                 |
-//+------------------------------------------------------------------+
-CTrade trade;
-string baseUrlSpot = "https://api.binance.com/api/v3/";
-datetime lastDebugTime = 0;
-datetime lastFetchTime = 0;
-const int fetchIntervalMs = 5000;  // Fetch Binance data every 5 seconds
+input string   t3 = "====== Risk Management ======";
+input double   MaxDailyLossPercent = 5.0;       // Max daily drawdown before halt
+input bool     UseTrailingStop    = true;       // Enable trailing stop
+input int      TrailingStartPoints = 30;        // Trailing activates at this profit (points)
+input int      TrailingStepPoints = 10;         // Trailing stop step (points)
+
+// --- Global Variables ---
+double   RsiBuffer[];
+double   AtrBuffer[];
+double   FastEMABuffer[];
+double   SlowEMABuffer[];
+int      RsiHandle, AtrHandle, FastEMAHandle, SlowEMAHandle;
+double   dailyLoss = 0.0;
+datetime lastBarTime = 0;
+bool     tradingHalted = false;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
-int OnInit() {
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
-   SymbolSelect(_Symbol, true);
+int OnInit()
+{
+   // Initialize indicator handles
+   RsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RsiPeriod, PRICE_CLOSE);
+   AtrHandle = iATR(_Symbol, PERIOD_CURRENT, AtrPeriod);
+   FastEMAHandle = iMA(_Symbol, PERIOD_CURRENT, FastMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   SlowEMAHandle = iMA(_Symbol, PERIOD_CURRENT, SlowMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
    
-   // Check if API key is empty, warn user
-   if(StringLen(userApiKey) == 0) {
-      Print("WARNING: No Binance API Key provided. Using public endpoints only.");
-      Print("For better reliability, please add your Binance API key.");
+   if(RsiHandle == INVALID_HANDLE || AtrHandle == INVALID_HANDLE ||
+      FastEMAHandle == INVALID_HANDLE || SlowEMAHandle == INVALID_HANDLE)
+   {
+      Print("Error creating indicator handles");
+      return(INIT_FAILED);
    }
    
-   Print("==============================================");
-   Print("🚀 Binance Order Flow Router EA INITIALIZED");
-   Print("   Binance Pair: ", BinancePair);
-   Print("   MT5 Symbol: ", _Symbol);
-   Print("   Imbalance Threshold: ", OrderBookImbalanceThreshold);
-   Print("   Order Book Depth: ", OrderBookDepth, " levels");
-   Print("   Risk Per Trade: ", RiskPerTradePercent, "% of equity");
-   Print("==============================================");
+   ArraySetAsSeries(RsiBuffer, true);
+   ArraySetAsSeries(AtrBuffer, true);
+   ArraySetAsSeries(FastEMABuffer, true);
+   ArraySetAsSeries(SlowEMABuffer, true);
+   
+   lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   tradingHalted = false;
+   
+   Print("✓ Aggressive Scalper EA initialized on ", _Symbol);
+   Print("✓ Signal Threshold: ", SignalThreshold, " | Risk: ", RiskPercent, "% per trade");
+   
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Helper: WebRequest with better error handling                   |
+//| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
-string WebRequestGet(string url) {
-   char post[], result[];
-   string headers;
-   int res = WebRequest("GET", url, NULL, NULL, 5000, post, 0, result, headers);
-   if(res <= 0) {
-      Print("❌ WebRequest failed to: ", url, " Error: ", GetLastError());
-      return "";
-   }
-   return CharArrayToString(result);
+void OnDeinit(const int reason)
+{
+   // Release indicator handles
+   IndicatorRelease(RsiHandle);
+   IndicatorRelease(AtrHandle);
+   IndicatorRelease(FastEMAHandle);
+   IndicatorRelease(SlowEMAHandle);
+   
+   Print("EA deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Bid-Ask Ratio from Binance Order Book                 |
+//| Expert tick function (main trading logic)                        |
 //+------------------------------------------------------------------+
-double GetOrderBookImbalance() {
-   string url = baseUrlSpot + "depth?symbol=" + BinancePair + "&limit=" + IntegerToString(OrderBookDepth);
-   string response = WebRequestGet(url);
-   if(response == "") return -1.0;  // Failed
-    
-   // Parse JSON manually (since MQL5 has no native JSON parser)
-   double totalBidVol = 0.0, totalAskVol = 0.0;
+void OnTick()
+{
+   // 1. Check if trading is halted due to daily loss limit
+   if(tradingHalted)
+   {
+      if(CalculateDailyLoss() < MaxDailyLossPercent)
+         tradingHalted = false;
+      else
+         return;
+   }
    
-   // Find bids array: "bids":[["price","vol"],...]
-   int bidsPos = StringFind(response, "\"bids\":[");
-   if(bidsPos >= 0) {
-      int startPos = bidsPos + 8; // After "bids":[ 
-      int endPos = StringFind(response, "],", startPos);
-      if(endPos < 0) endPos = StringFind(response, "]]", startPos);
-      if(endPos > startPos) {
-         string bidsStr = StringSubstr(response, startPos, endPos - startPos);
-         // Parse each bid entry ["price","vol"]
-         int searchPos = 0;
-         while(searchPos < StringLen(bidsStr)) {
-            int volStart = StringFind(bidsStr, ",\"", searchPos);
-            if(volStart < 0) break;
-            volStart += 2;  // Skip past ',"'
-            int volEnd = StringFind(bidsStr, "\"", volStart);
-            if(volEnd > volStart) {
-               double vol = StringToDouble(StringSubstr(bidsStr, volStart, volEnd - volStart));
-               totalBidVol += vol;
-            }
-            searchPos = volEnd + 1;
-         }
+   // 2. Update daily loss tracking
+   double dailyLossPercent = CalculateDailyLoss();
+   if(dailyLossPercent >= MaxDailyLossPercent) 
+   {
+      tradingHalted = true;
+      Print("Daily loss limit reached (", dailyLossPercent, "%). Trading halted.");
+      return;
+   }
+   
+   // 3. Check for new bar (only trade at bar close to reduce noise)
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(currentBarTime == lastBarTime) return;
+   lastBarTime = currentBarTime;
+   
+   // 4. Refresh indicator values
+   CopyBuffer(RsiHandle, 0, 0, 3, RsiBuffer);
+   CopyBuffer(AtrHandle, 0, 0, 3, AtrBuffer);
+   CopyBuffer(FastEMAHandle, 0, 0, 3, FastEMABuffer);
+   CopyBuffer(SlowEMAHandle, 0, 0, 3, SlowEMABuffer);
+   
+   double currentRsi = RsiBuffer[0];
+   double currentAtr = AtrBuffer[0];
+   double fastEMA = FastEMABuffer[0];
+   double slowEMA = SlowEMABuffer[0];
+   double prevFastEMA = FastEMABuffer[1];
+   double prevSlowEMA = SlowEMABuffer[1];
+   
+   // 5. Count open positions for this symbol
+   int posCount = CountOpenPositions();
+   if(posCount >= MaxConcurrentTrades) return;
+   
+   // 6. Calculate signal scores
+   double buyScore = CalculateBuyScore(currentRsi, fastEMA, slowEMA, prevFastEMA, prevSlowEMA, currentAtr);
+   double sellScore = CalculateSellScore(currentRsi, fastEMA, slowEMA, prevFastEMA, prevSlowEMA, currentAtr);
+   
+   // 7. Execute trades if threshold met
+   if(buyScore >= SignalThreshold)
+      ExecuteTrade(ORDER_TYPE_BUY);
+   else if(sellScore >= SignalThreshold)
+      ExecuteTrade(ORDER_TYPE_SELL);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate buy signal score (0-100)                               |
+//+------------------------------------------------------------------+
+double CalculateBuyScore(double rsi, double fastEMA, double slowEMA, 
+                          double prevFast, double prevSlow, double atr)
+{
+   double score = 0.0;
+   
+   // Trend factor: EMA alignment (max 35 points)
+   if(fastEMA > slowEMA)
+      score += 25;
+   // EMA just crossed up?
+   if(prevFast <= prevSlow && fastEMA > slowEMA)
+      score += 10;
+      
+   // Momentum factor: RSI condition (max 30 points)
+   if(rsi < RsiBuyThreshold)
+      score += 30;
+   else if(rsi < RsiBuyThreshold + 10)
+      score += 15;
+   else if(rsi < RsiBuyThreshold + 20)
+      score += 5;
+   
+   // Volatility factor: ATR validation (max 20 points)
+   double normalizedATR = atr / _Point / 10;  // ATR in pips approx
+   if(normalizedATR > MinATRMultiplier * 5)   // enough movement
+      score += 20;
+   else if(normalizedATR > MinATRMultiplier * 3)
+      score += 10;
+      
+   // Price action / impulse detection (max 15 points)
+   double close = iClose(_Symbol, PERIOD_CURRENT, 0);
+   double open = iOpen(_Symbol, PERIOD_CURRENT, 0);
+   double body = close - open;
+   if(body > 0 && body > (iHigh(_Symbol, PERIOD_CURRENT, 0) - iLow(_Symbol, PERIOD_CURRENT, 0)) * 0.6)
+      score += 15;
+   else if(body > 0)
+      score += 8;
+   
+   return score;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate sell signal score (0-100)                              |
+//+------------------------------------------------------------------+
+double CalculateSellScore(double rsi, double fastEMA, double slowEMA,
+                           double prevFast, double prevSlow, double atr)
+{
+   double score = 0.0;
+   
+   // Trend factor: EMA alignment (max 35 points)
+   if(fastEMA < slowEMA)
+      score += 25;
+   if(prevFast >= prevSlow && fastEMA < slowEMA)
+      score += 10;
+      
+   // Momentum factor: RSI condition (max 30 points)
+   if(rsi > RsiSellThreshold)
+      score += 30;
+   else if(rsi > RsiSellThreshold - 10)
+      score += 15;
+   else if(rsi > RsiSellThreshold - 20)
+      score += 5;
+   
+   // Volatility factor: ATR validation (max 20 points)
+   double normalizedATR = atr / _Point / 10;
+   if(normalizedATR > MinATRMultiplier * 5)
+      score += 20;
+   else if(normalizedATR > MinATRMultiplier * 3)
+      score += 10;
+      
+   // Price action: bearish impulse detection (max 15 points)
+   double close = iClose(_Symbol, PERIOD_CURRENT, 0);
+   double open = iOpen(_Symbol, PERIOD_CURRENT, 0);
+   double body = close - open;
+   if(body < 0 && -body > (iHigh(_Symbol, PERIOD_CURRENT, 0) - iLow(_Symbol, PERIOD_CURRENT, 0)) * 0.6)
+      score += 15;
+   else if(body < 0)
+      score += 8;
+   
+   return score;
+}
+
+//+------------------------------------------------------------------+
+//| Execute a market order                                           |
+//+------------------------------------------------------------------+
+void ExecuteTrade(int orderType)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult  result = {};
+   
+   double price = (orderType == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) 
+                                                 : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl = 0, tp = 0;
+   
+   // Calculate stop loss and take profit
+   if(orderType == ORDER_TYPE_BUY)
+   {
+      sl = price - StopLossPoints * _Point;
+      tp = price + TakeProfitPoints * _Point;
+   }
+   else // SELL
+   {
+      sl = price + StopLossPoints * _Point;
+      tp = price - TakeProfitPoints * _Point;
+   }
+   
+   // Normalize SL/TP to broker requirements
+   sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   
+   // Calculate lot size based on risk percentage
+   double lotSize = CalculateLotSize(orderType, sl, price);
+   if(lotSize <= 0) return;
+   
+   // Prepare and send order
+   request.action     = TRADE_ACTION_DEAL;
+   request.symbol     = _Symbol;
+   request.volume     = lotSize;
+   request.type       = orderType;
+   request.price      = price;
+   request.sl         = sl;
+   request.tp         = tp;
+   request.deviation  = 10;
+   request.magic      = MagicNumber;
+   request.comment    = "Aggressive Scalper";
+   request.type_filling = ORDER_FILLING_FOK;
+   request.type_time  = ORDER_TIME_GTC;
+   
+   if(OrderSend(request, result))
+   {
+      if(result.retcode == TRADE_RETCODE_DONE)
+      {
+         Print("✓ ORDER EXECUTED | Type: ", (orderType == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+               " | Lots: ", lotSize, " | Price: ", price,
+               " | SL: ", sl, " | TP: ", tp,
+               " | Ticket: ", result.order);
+      }
+      else
+         Print("✗ Order failed | Error: ", result.retcode, " - ", GetLastError());
+   }
+   else
+      Print("✗ Order send error: ", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size based on risk percentage                      |
+//+------------------------------------------------------------------+
+double CalculateLotSize(int orderType, double slPrice, double entryPrice)
+{
+   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double stopDistance = MathAbs(entryPrice - slPrice);
+   double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double stopInPoints = stopDistance / pointValue;
+   
+   double lotSize = riskAmount / (stopInPoints * tickValue);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
+   lotSize = MathRound(lotSize / stepLot) * stepLot;
+   
+   return lotSize;
+}
+
+//+------------------------------------------------------------------+
+//| Count open positions for this symbol and magic number            |
+//+------------------------------------------------------------------+
+int CountOpenPositions()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionSelectByTicket(PositionGetTicket(i)))
+      {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            count++;
       }
    }
-   
-   // Find asks array: "asks":[["price","vol"],...]
-   int asksPos = StringFind(response, "\"asks\":[");
-   if(asksPos >= 0) {
-      int startPos = asksPos + 8; // After "asks":[ 
-      int endPos = StringFind(response, "]]", startPos);
-      if(endPos > startPos) {
-         string asksStr = StringSubstr(response, startPos, endPos - startPos);
-         int searchPos = 0;
-         while(searchPos < StringLen(asksStr)) {
-            int volStart = StringFind(asksStr, ",\"", searchPos);
-            if(volStart < 0) break;
-            volStart += 2;
-            int volEnd = StringFind(asksStr, "\"", volStart);
-            if(volEnd > volStart) {
-               double vol = StringToDouble(StringSubstr(asksStr, volStart, volEnd - volStart));
-               totalAskVol += vol;
-            }
-            searchPos = volEnd + 1;
-         }
-      }
-   }
-   
-   // Apply ratio formula: totalBidVol / (totalBidVol + totalAskVol)
-   if(totalBidVol + totalAskVol == 0) return -1.0;
-   double ratio = totalBidVol / (totalBidVol + totalAskVol);
-   
-   if(DebugMode && TimeCurrent() - lastDebugTime >= 5) {
-      Print("📊 [Book] BidVol: ", DoubleToString(totalBidVol, 2), 
-            " AskVol: ", DoubleToString(totalAskVol, 2),
-            " Ratio: ", DoubleToString(ratio, 3));
-   }
-   return ratio;
+   return count;
 }
 
 //+------------------------------------------------------------------+
-//| Get Trade Flow Imbalance (Aggressor from recent trades)         |
-//| Returns positive for buying pressure, negative for selling      |
+//| Calculate daily loss percentage from peak equity                |
 //+------------------------------------------------------------------+
-double GetTradeFlowImbalance() {
-   string url = baseUrlSpot + "trades?symbol=" + BinancePair + "&limit=50";
-   string response = WebRequestGet(url);
-   if(response == "") return 0.0;
+double CalculateDailyLoss()
+{
+   static double peakEquityToday = 0;
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    
-   double buyVol = 0.0, sellVol = 0.0;
+   datetime currentTime = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(currentTime, dt);
+   dt.hour = 0; dt.min = 0; dt.sec = 0;
+   datetime midnight = StructToTime(dt);
    
-   // Parse trade array, look for "isBuyerMaker":true/false
-   // If isBuyerMaker is false → aggressive buy (taker bought from maker)
-   // If isBuyerMaker is true → aggressive sell (taker sold to maker)
-   int searchPos = 0;
-   while(true) {
-      int makerPos = StringFind(response, "\"isBuyerMaker\":", searchPos);
-      if(makerPos < 0) break;
-      int valueStart = makerPos + 16;
-      int valueEnd = (StringFind(response, ",\"", valueStart) < 0) ? 
-                     StringFind(response, "}", valueStart) : 
-                     StringFind(response, ",\"", valueStart);
-      if(valueEnd < 0) break;
-      string isMaker = StringSubstr(response, valueStart, valueEnd - valueStart);
-      
-      // Find volume for this trade
-      int volPos = StringFind(response, "\"quoteQty\":", searchPos);
-      if(volPos < 0) break;
-      int volStart = volPos + 11;
-      int volEnd = StringFind(response, ",\"", volStart);
-      if(volEnd < 0) volEnd = StringFind(response, "}", volStart);
-      if(volEnd < 0) break;
-      double vol = StringToDouble(StringSubstr(response, volStart, volEnd - volStart));
-      
-      if(isMaker == "false") buyVol += vol;   // Aggressive buy
-      else if(isMaker == "true") sellVol += vol;   // Aggressive sell
-      
-      searchPos = volEnd + 1;
+   static datetime lastMidnight = 0;
+   if(lastMidnight != midnight)
+   {
+      peakEquityToday = currentEquity;
+      lastMidnight = midnight;
    }
    
-   double totalVol = buyVol + sellVol;
-   if(totalVol == 0) return 0.0;
-   double netImbalance = (buyVol - sellVol) / totalVol;  // Range -1 to +1
-   
-   if(DebugMode && TimeCurrent() - lastDebugTime >= 5) {
-      Print("📊 [Trades] BuyVol: ", DoubleToString(buyVol, 2), 
-            " SellVol: ", DoubleToString(sellVol, 2),
-            " Net Imbalance: ", DoubleToString(netImbalance, 3));
-   }
-   return netImbalance;
+   if(currentEquity > peakEquityToday)
+      peakEquityToday = currentEquity;
+      
+   if(peakEquityToday == 0)
+      return 0;
+      
+   double drawdownPercent = (peakEquityToday - currentEquity) / peakEquityToday * 100.0;
+   return drawdownPercent;
 }
 
 //+------------------------------------------------------------------+
-//| Main Expert Tick Function                                        |
+//| Apply trailing stop to existing positions (called in OnTick)    |
 //+------------------------------------------------------------------+
-void OnTick() {
-   // 1. Close any position with profit > 0 (Fast Out)
-   for(int i = PositionsTotal()-1; i >= 0; i--) {
+void ApplyTrailingStop()
+{
+   if(!UseTrailingStop) return;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
-         double profit = PositionGetDouble(POSITION_PROFIT);
-         if(profit > 0.0) {
-            if(trade.PositionClose(ticket)) {
-               Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
-            } else {
-               Print("❌ [CLOSE] Failed to close ticket ", ticket);
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol ||
+            PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+            continue;
+            
+         double currentSL = PositionGetDouble(POSITION_SL);
+         double currentTP = PositionGetDouble(POSITION_TP);
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double currentPrice = PositionGetDouble(POSITION_TYPE) == POSITION_TYPE_BUY ? 
+                               SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                               SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double profitPoints = (currentPrice - openPrice) / _Point;
+         if(PositionGetDouble(POSITION_TYPE) == POSITION_TYPE_SELL)
+            profitPoints = -profitPoints;
+            
+         if(profitPoints >= TrailingStartPoints)
+         {
+            double newSL = 0;
+            if(PositionGetDouble(POSITION_TYPE) == POSITION_TYPE_BUY)
+               newSL = currentPrice - TrailingStepPoints * _Point;
+            else
+               newSL = currentPrice + TrailingStepPoints * _Point;
+               
+            if(newSL > currentSL)
+            {
+               MqlTradeRequest req = {};
+               MqlTradeResult res = {};
+               req.action = TRADE_ACTION_SLTP;
+               req.symbol = _Symbol;
+               req.position = ticket;
+               req.sl = newSL;
+               req.tp = currentTP;
+               req.magic = MagicNumber;
+               OrderSend(req, res);
             }
-         }
-      }
-   }
-   
-   // 2. Position limit check
-   if(PositionsTotal() >= MaxOpenPositions) {
-      if(DebugMode && TimeCurrent() - lastDebugTime >= 30) {
-         Print("⚠️ Max positions reached: ", PositionsTotal());
-      }
-      return;
-   }
-   
-   // 3. Fetch Binance data at intervals (not every tick to avoid rate limits)
-   if(TimeCurrent() * 1000 - lastFetchTime < fetchIntervalMs) return;
-   lastFetchTime = TimeCurrent() * 1000;
-   
-   // 4. Get both signals
-   double bookImbalance = GetOrderBookImbalance();      // Ratio 0-1
-   double tradeFlow = GetTradeFlowImbalance();          // Net -1 to +1
-   
-   if(bookImbalance < 0) {
-      Print("❌ Failed to fetch Binance order book data");
-      return;
-   }
-   
-   // 5. Determine signal direction
-   bool buySignal = false;
-   bool sellSignal = false;
-   string signalStrength = "none";
-   
-   // Strong buy: Book ratio > threshold AND trade flow positive
-   if(bookImbalance >= OrderBookImbalanceThreshold && tradeFlow > 0.2) {
-      buySignal = true;
-      signalStrength = "STRONG BUY";
-   }
-   // Strong sell: Book ratio < (1 - threshold) AND trade flow negative
-   else if(bookImbalance <= (1.0 - OrderBookImbalanceThreshold) && tradeFlow < -0.2) {
-      sellSignal = true;
-      signalStrength = "STRONG SELL";
-   }
-   // Medium signal: Only one condition met
-   else if(bookImbalance >= OrderBookImbalanceThreshold && tradeFlow <= 0.2) {
-      buySignal = true;
-      signalStrength = "WEAK BUY (book only)";
-   }
-   else if(bookImbalance <= (1.0 - OrderBookImbalanceThreshold) && tradeFlow >= -0.2) {
-      sellSignal = true;
-      signalStrength = "WEAK SELL (book only)";
-   }
-   
-   // 6. Debug output
-   if(DebugMode) {
-      Print("========================================");
-      Print("📊 SIGNAL ANALYSIS:");
-      Print("   Book Ratio: ", DoubleToString(bookImbalance, 3));
-      Print("   Trade Flow: ", DoubleToString(tradeFlow, 3));
-      Print("   Signal: ", signalStrength);
-      Print("========================================");
-   }
-   
-   // 7. Execute trade based on signal
-   if(buySignal || sellSignal) {
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPerTradePercent / 100.0), 2);
-      lot = MathMax(0.01, lot);
-      
-      if(buySignal) {
-         if(trade.Buy(lot, _Symbol, ask, 0, 0, "Binance Flow Buy")) {
-            Print("🔥 [BUY OPEN] Signal: ", signalStrength, " | Lot: ", lot, " @ ", ask);
-         } else {
-            Print("❌ [BUY FAIL] Error: ", GetLastError());
-         }
-      }
-      else if(sellSignal) {
-         if(trade.Sell(lot, _Symbol, bid, 0, 0, "Binance Flow Sell")) {
-            Print("🔥 [SELL OPEN] Signal: ", signalStrength, " | Lot: ", lot, " @ ", bid);
-         } else {
-            Print("❌ [SELL FAIL] Error: ", GetLastError());
          }
       }
    }
