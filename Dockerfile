@@ -20,286 +20,155 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                        Aggressive_Cent_Scalper  |
-//|                              Opens trades frequently on M1      |
-//|                                      Target $2/day on $10 cent  |
+//|                                      الروبوت الرابح - Exact 3pt |
+//|                     Only trades when difference ≈ 3 points      |
 //+------------------------------------------------------------------+
-#property copyright "Aggressive Scalper"
-#property version   "3.00"
-#property strict
-
 #include <Trade\Trade.mqh>
 
-// --- Inputs (Aggressive Settings) ---
-input string   t1 = "==== Money Management ====";
-input double   RiskPercent       = 10.0;       // 10% risk per trade (aggressive)
-input int      StopLossPoints    = 100;        // 10 pips SL
-input int      TakeProfitPoints  = 50;         // 5 pips TP (faster wins)
-input int      MaxConcurrentTrades = 3;        // Up to 3 positions at once
-input int      MagicNumber       = 999888;
+#property copyright "Omni-Apex V22.0 - Modified"
+#property version   "22.01"
+#property strict
 
-input string   t2 = "==== Entry Triggers (Aggressive) ====";
-input bool     UseMomentum       = true;       // Trade on price momentum (recommended)
-input int      MomentumPoints    = 15;         // If price moves 1.5 pips in last 5 seconds, trade
-input bool     UseRSI            = true;       // Use RSI as secondary confirmation
-input int      RsiPeriod         = 7;          // Fast RSI
-input int      RsiBuyLevel       = 40;         // Buy when RSI < 40
-input int      RsiSellLevel      = 60;         // Sell when RSI > 60
-input bool     UseMA             = false;      // Optional moving average filter
-input int      MAPeriod          = 20;         // For trend filter
+// --- INPUTS
+input string BinanceSymbol     = "BTCUSDT";
+input double RiskPercent       = 1.0;          // % of equity per trade
+input int    MinDiff_Points    = 3;            // Desired difference (absolute value)
+input double DiffExactTolerance = 0.5;         // Acceptable deviation (± points) – trade only when diff ≈ MinDiff_Points
+input int    MaxOpenPositions  = 5;
+input int    MagicNumber       = 999022;
 
-input string   t3 = "==== Filters ====";
-input int      MaxSpreadPoints   = 30;         // Max 3 pips spread
-input bool     UseATRFilter      = false;      // Disable ATR filter for more trades
-input double   MinATRMultiplier  = 0.1;        // Very low if enabled
-input int      ATRPeriod         = 14;
-
-input string   t4 = "==== Daily Limits ====";
-input double   DailyTargetUSD    = 2.0;        // Stop after $2 profit
-input double   MaxDailyLossUSD   = 1.0;        // Stop after $1 loss
-input bool     UseTrailingStop   = true;
-input int      TrailingStartPts  = 30;         // Start trailing at 3 pips profit
-input int      TrailingStepPts   = 15;         // Trail by 1.5 pips
-
-// --- Globals ---
+// --- GLOBALS
 CTrade trade;
-int rsi_handle, atr_handle, ma_handle;
-double rsi_buf[], atr_buf[], ma_buf[];
-datetime lastBarTime = 0;
-double dailyProfit = 0.0;
-double startBalance = 0.0;
-bool tradingHalted = false;
-datetime lastTradeTime = 0;
-int tradeCountToday = 0;
+string binance_url;
+datetime last_debug_time = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
 //+------------------------------------------------------------------+
 int OnInit() {
+   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
    trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_FOK);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   SymbolSelect(_Symbol, true);
    
-   // Create indicators
-   if(UseRSI) rsi_handle = iRSI(_Symbol, PERIOD_M1, RsiPeriod, PRICE_CLOSE);
-   if(UseATRFilter) atr_handle = iATR(_Symbol, PERIOD_M1, ATRPeriod);
-   if(UseMA) ma_handle = iMA(_Symbol, PERIOD_M1, MAPeriod, 0, MODE_SMA, PRICE_CLOSE);
-   
-   ArraySetAsSeries(rsi_buf, true);
-   ArraySetAsSeries(atr_buf, true);
-   ArraySetAsSeries(ma_buf, true);
-   
-   startBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   
-   Print("==========================================");
-   Print("⚡ AGGRESSIVE CENT SCALPER ACTIVE");
-   Print("   Balance: $", startBalance);
-   Print("   Risk per trade: ", RiskPercent, "%");
-   Print("   TP: ", TakeProfitPoints/10.0, " pips | SL: ", StopLossPoints/10.0, " pips");
-   Print("   Momentum trigger: ", MomentumPoints, " points");
-   Print("   Daily target: $", DailyTargetUSD);
-   Print("==========================================");
-   
-   return INIT_SUCCEEDED;
+   Print("==============================================");
+   Print("🟢 EA - EXACT 3 POINT DIFFERENCE TRADER");
+   Print("   Binance Symbol: ", BinanceSymbol);
+   Print("   MT5 Symbol: ", _Symbol);
+   Print("   Target difference: ", MinDiff_Points, " ± ", DiffExactTolerance, " points");
+   Print("==============================================");
+   return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Deinitialization                                               |
+//| Helper: Extract double from JSON                                 |
 //+------------------------------------------------------------------+
-void OnDeinit(const int reason) {
-   if(UseRSI) IndicatorRelease(rsi_handle);
-   if(UseATRFilter) IndicatorRelease(atr_handle);
-   if(UseMA) IndicatorRelease(ma_handle);
+double GetJsonDouble(string text, string key) {
+   int pos = StringFind(text, key);
+   if(pos == -1) return -1;
+   int start = pos + StringLen(key);
+   int end = StringFind(text, "\"", start);
+   if(end == -1) end = StringFind(text, ",", start);
+   if(end == -1) end = StringLen(text);
+   string substr = StringSubstr(text, start, end - start);
+   return StringToDouble(substr);
 }
 
 //+------------------------------------------------------------------+
-//| Main tick function (very frequent trades)                       |
+//| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- Daily profit limits ---
-   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   dailyProfit = currentBalance - startBalance;
-   
-   if(dailyProfit >= DailyTargetUSD) {
-      if(!tradingHalted) Print("🎯 Daily target $", DailyTargetUSD, " reached. Halted.");
-      tradingHalted = true;
-      return;
-   }
-   if(dailyProfit <= -MaxDailyLossUSD) {
-      if(!tradingHalted) Print("💀 Max daily loss $", MaxDailyLossUSD, " hit. Halted.");
-      tradingHalted = true;
-      return;
-   }
-   if(tradingHalted) {
-      static datetime lastReset = 0;
-      datetime now = TimeCurrent();
-      MqlDateTime dt;
-      TimeToStruct(now, dt);
-      dt.hour = 0; dt.min = 0; dt.sec = 0;
-      datetime midnight = StructToTime(dt);
-      if(midnight != lastReset) {
-         lastReset = midnight;
-         tradingHalted = false;
-         startBalance = currentBalance;
-         tradeCountToday = 0;
-         Print("🔄 New trading day - Resuming");
-      }
-      return;
-   }
-   
-   // --- Spread filter ---
-   int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   if(spread > MaxSpreadPoints) return;
-   
-   // --- Optional ATR filter (disabled by default for more trades)---
-   if(UseATRFilter) {
-      CopyBuffer(atr_handle, 0, 0, 2, atr_buf);
-      double atrPips = atr_buf[0] / SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 10.0;
-      if(atrPips < MinATRMultiplier) return;
-   }
-   
-   // --- Count open positions ---
-   int posCount = 0;
+   // --- 1. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT) ---
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket)) {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber) posCount++;
-      }
-   }
-   if(posCount >= MaxConcurrentTrades) return;
-   
-   // --- COOLDOWN: avoid too many trades per second (0.5 sec) ---
-   if(TimeCurrent() - lastTradeTime < 0.5) return;
-   
-   // --- Calculate signals ---
-   bool buySignal = false;
-   bool sellSignal = false;
-   
-   // 1. Momentum trigger (price movement in last few ticks)
-   if(UseMomentum) {
-      double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      static double previousPrice = 0;
-      static datetime lastCheck = 0;
-      
-      if(TimeCurrent() - lastCheck >= 2) {  // Check every 2 seconds
-         double move = MathAbs(currentPrice - previousPrice) / _Point;
-         if(previousPrice != 0 && move >= MomentumPoints) {
-            if(currentPrice > previousPrice) buySignal = true;
-            else sellSignal = true;
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         if(profit > 0.0) {
+            if(trade.PositionClose(ticket)) {
+               Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
+            } else {
+               Print("❌ [CLOSE] Failed, error: ", GetLastError());
+            }
          }
-         previousPrice = currentPrice;
-         lastCheck = TimeCurrent();
       }
    }
    
-   // 2. RSI confirmation (if enabled and no momentum signal yet)
-   if(UseRSI && !buySignal && !sellSignal) {
-      if(CopyBuffer(rsi_handle, 0, 0, 2, rsi_buf) < 2) return;
-      double rsi = rsi_buf[0];
-      if(rsi < RsiBuyLevel) buySignal = true;
-      if(rsi > RsiSellLevel) sellSignal = true;
+   // --- 2. POSITION LIMIT ---
+   if(PositionsTotal() >= MaxOpenPositions) {
+      static int throttle = 0;
+      if(throttle++ % 100 == 0) Print("⚠️ Max positions reached: ", PositionsTotal());
+      return;
    }
    
-   // 3. Moving average trend filter (optional, can be disabled)
-   if(UseMA && (buySignal || sellSignal)) {
-      if(CopyBuffer(ma_handle, 0, 0, 2, ma_buf) < 2) return;
-      double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(buySignal && price < ma_buf[0]) buySignal = false;  // Don't buy below MA
-      if(sellSignal && price > ma_buf[0]) sellSignal = false;
+   // --- 3. GET MT5 PRICES ---
+   double mt5_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double mt5_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(mt5_ask <= 0 || mt5_bid <= 0) {
+      Print("❌ MT5 price error");
+      return;
+   }
+   double mt5_mid = (mt5_ask + mt5_bid) / 2.0;
+   
+   // --- 4. FETCH BINANCE PRICES ---
+   char post[], result[];
+   string headers;
+   int res = WebRequest("GET", binance_url, NULL, NULL, 5000, post, 0, result, headers);
+   if(res <= 0) {
+      Print("❌ WebRequest failed. Error: ", GetLastError());
+      return;
    }
    
-   // --- If no signal, do nothing ---
-   if(!buySignal && !sellSignal) return;
+   string resp = CharArrayToString(result);
+   double binance_bid = GetJsonDouble(resp, "\"bidPrice\":\"");
+   double binance_ask = GetJsonDouble(resp, "\"askPrice\":\"");
+   if(binance_bid <= 0 || binance_ask <= 0) {
+      Print("❌ Binance parse error. Response: ", StringSubstr(resp, 0, 200));
+      return;
+   }
+   double binance_mid = (binance_ask + binance_bid) / 2.0;
    
-   // --- Execute trade ---
+   // --- 5. CALCULATE DIFFERENCE (in points) ---
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double lot = CalculateLotSize();
+   double diff_points = (binance_mid - mt5_mid) / point;
+   
+   // --- 6. NEW LOGIC: trade only when diff is approximately MinDiff_Points (± tolerance) ---
+   double absDiff = MathAbs(diff_points);
+   bool exactDiff = (absDiff >= MinDiff_Points - DiffExactTolerance && 
+                     absDiff <= MinDiff_Points + DiffExactTolerance);
+   
+   bool buy_signal = (diff_points > 0 && exactDiff);
+   bool sell_signal = (diff_points < 0 && exactDiff);
+   
+   // --- 7. DEBUG OUTPUT (every 5 seconds) ---
+   if(TimeCurrent() - last_debug_time >= 5) {
+      last_debug_time = TimeCurrent();
+      Print("========================================");
+      Print("📊 MT5   Ask: ", DoubleToString(mt5_ask, _Digits), "  Bid: ", DoubleToString(mt5_bid, _Digits));
+      Print("📊 Binance Ask: ", DoubleToString(binance_ask, _Digits), " Bid: ", DoubleToString(binance_bid, _Digits));
+      Print("📊 MT5 Mid: ", DoubleToString(mt5_mid, _Digits));
+      Print("📊 Binance Mid: ", DoubleToString(binance_mid, _Digits));
+      Print("📊 Difference: ", DoubleToString(diff_points, 2), " points");
+      Print("📊 Exact 3pt match: ", exactDiff ? "YES" : "NO");
+      Print("📊 Buy signal: ", buy_signal ? "YES" : "NO", " | Sell signal: ", sell_signal ? "YES" : "NO");
+      Print("========================================");
+   }
+   
+   // --- 8. OPEN TRADE ONLY WHEN EXACT DIFFERENCE IS NEAR 3 POINTS ---
+   double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    
-   if(buySignal) {
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double sl = ask - StopLossPoints * point;
-      double tp = ask + TakeProfitPoints * point;
-      sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-      tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-      
-      if(trade.Buy(lot, _Symbol, ask, sl, tp, "AggBuy")) {
-         Print("🔥 BUY | Lot=", lot, " | TP=", tp, " | SL=", sl);
-         lastTradeTime = TimeCurrent();
-         tradeCountToday++;
+   if(buy_signal) {
+      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Exact3pt Buy")) {
+         Print("🔥 [BUY OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_ask);
       } else {
-         Print("❌ Buy failed. Error: ", GetLastError());
+         Print("❌ [BUY FAIL] Error: ", GetLastError());
       }
    }
-   else if(sellSignal) {
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double sl = bid + StopLossPoints * point;
-      double tp = bid - TakeProfitPoints * point;
-      sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-      tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-      
-      if(trade.Sell(lot, _Symbol, bid, sl, tp, "AggSell")) {
-         Print("🔥 SELL | Lot=", lot, " | TP=", tp, " | SL=", sl);
-         lastTradeTime = TimeCurrent();
-         tradeCountToday++;
+   else if(sell_signal) {
+      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Exact3pt Sell")) {
+         Print("🔥 [SELL OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_bid);
       } else {
-         Print("❌ Sell failed. Error: ", GetLastError());
-      }
-   }
-   
-   // --- Apply trailing stop to open positions ---
-   if(UseTrailingStop) ApplyTrailingStop();
-}
-
-//+------------------------------------------------------------------+
-//| Calculate lot size based on risk %                               |
-//+------------------------------------------------------------------+
-double CalculateLotSize() {
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmount = balance * RiskPercent / 100.0;
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double slPoints = StopLossPoints;
-   double riskPerLot = slPoints * tickValue;
-   double lot = riskAmount / riskPerLot;
-   
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   lot = MathMax(minLot, MathMin(maxLot, lot));
-   lot = MathRound(lot / stepLot) * stepLot;
-   lot = MathMax(0.01, lot);
-   return lot;
-}
-
-//+------------------------------------------------------------------+
-//| Trailing stop                                                   |
-//+------------------------------------------------------------------+
-void ApplyTrailingStop() {
-   for(int i = PositionsTotal()-1; i >= 0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-      
-      double currentSL = PositionGetDouble(POSITION_SL);
-      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      double currentPrice = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ?
-                            SymbolInfoDouble(_Symbol, SYMBOL_BID) :
-                            SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double profitPoints = (currentPrice - openPrice) / _Point;
-      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-         profitPoints = -profitPoints;
-      
-      if(profitPoints >= TrailingStartPts) {
-         double newSL = 0;
-         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
-            newSL = currentPrice - TrailingStepPts * _Point;
-            if(newSL > currentSL)
-               trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
-         } else {
-            newSL = currentPrice + TrailingStepPts * _Point;
-            if(newSL < currentSL || currentSL == 0)
-               trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
-         }
+         Print("❌ [SELL FAIL] Error: ", GetLastError());
       }
    }
 }
