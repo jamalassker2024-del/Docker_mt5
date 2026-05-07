@@ -20,191 +20,233 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                      الروبوت الرابح - Exact 3pt |
-//|                     Only trades when difference ≈ 3 points      |
-//|                     + Time filter: London session (8-22)        |
+//|                                 Triangular_Arbitrage_EA.mq5      |
+//|                     Synthetic triangular arbitrage - risk‑free   |
+//|                             Version 2.0 - Fast profit exit      |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex V22.0 - Modified"
-#property version   "22.03"
+#property copyright "Omni-Apex Arbitrage"
+#property version   "2.0"
 #property strict
 
-// --- INPUTS
-input string BinanceSymbol     = "BTCUSDT";
-input double RiskPercent       = 1.0;          // % of equity per trade
-input int    MinDiff_Points    = 3;            // Desired difference (absolute value)
-input double DiffExactTolerance = 0.5;         // Acceptable deviation (± points) – trade only when diff ≈ MinDiff_Points
-input int    MaxOpenPositions  = 5;
-input int    MagicNumber       = 999022;
+// --- INPUTS --------------------------------------------------------+
+input string   Symbol1         = "GBPUSD";      // Leg 1
+input string   Symbol2         = "USDJPY";      // Leg 2
+input string   Symbol3         = "GBPJPY";      // Synthetic cross
+input double   RiskPercent     = 3.0;           // % equity per basket
+input int      MinProfitPoints = 5;             // Minimum profit in points before closing
+input int      MaxOpenBaskets  = 2;             // Max concurrent triangular positions
+input int      MagicNumber     = 888999;
+input int      StartHour       = 8;             // London session start
+input int      EndHour         = 22;            // Session end
+input double   MinSpreadRatio  = 0.0;           // Minimum mispricing ratio (0 = any mispricing)
 
-// --- NEW TIME FILTER INPUTS
-input int    StartHour         = 8;            // London session start (server time, 24h format)
-input int    EndHour           = 22;           // Session end – at this hour all trades closed, no new trades
-
-// --- GLOBALS
+// --- GLOBALS -------------------------------------------------------+
 CTrade trade;
-string binance_url;
-datetime last_debug_time = 0;
+datetime last_debug = 0;
+datetime last_trade = 0;
+datetime dayStart = 0;
+double dailyEquityStart = 0;
+int consecutiveLosses = 0;
+
+struct Basket {
+   ulong ticket1;
+   ulong ticket2;
+   ulong ticket3;
+   double profitLock;
+   bool   closed;
+};
+Basket baskets[];
+int activeBaskets = 0;
 
 //+------------------------------------------------------------------+
-//| Helper: Check if we are inside trading hours (fixed)            |
+//| Check trading hours                                             |
 //+------------------------------------------------------------------+
 bool IsTradingTime() {
    MqlDateTime dt;
-   TimeCurrent(dt);            // fills dt structure safely
-   int hour = dt.hour;         // broker/server time
-   return (hour >= StartHour && hour < EndHour);
+   TimeCurrent(dt);
+   return (dt.hour >= StartHour && dt.hour < EndHour);
 }
 
 //+------------------------------------------------------------------+
-//| Close all open positions                                         |
+//| Close all positions for a basket                                 |
 //+------------------------------------------------------------------+
-void CloseAllPositions() {
-   for(int i = PositionsTotal()-1; i >= 0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
-         trade.PositionClose(ticket);
-         Print("🕒 [SESSION END] Closed position ", ticket);
-      }
+void CloseBasket(int idx) {
+   if(baskets[idx].ticket1 > 0) trade.PositionClose(baskets[idx].ticket1);
+   if(baskets[idx].ticket2 > 0) trade.PositionClose(baskets[idx].ticket2);
+   if(baskets[idx].ticket3 > 0) trade.PositionClose(baskets[idx].ticket3);
+   baskets[idx].closed = true;
+}
+
+//+------------------------------------------------------------------+
+//| Find basket index by ticket                                      |
+//+------------------------------------------------------------------+
+int FindBasketByTicket(ulong ticket) {
+   for(int i=0; i<ArraySize(baskets); i++) {
+      if(baskets[i].ticket1 == ticket || baskets[i].ticket2 == ticket || baskets[i].ticket3 == ticket)
+         return i;
    }
+   return -1;
 }
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                           |
+//| Calculate synthetic rate and mispricing (in points)             |
+//+------------------------------------------------------------------+
+double CalculateMispricingPoints() {
+   // Get bid/ask for each leg
+   double bid1 = SymbolInfoDouble(Symbol1, SYMBOL_BID);
+   double ask1 = SymbolInfoDouble(Symbol1, SYMBOL_ASK);
+   double bid2 = SymbolInfoDouble(Symbol2, SYMBOL_BID);
+   double ask2 = SymbolInfoDouble(Symbol2, SYMBOL_ASK);
+   double bid3 = SymbolInfoDouble(Symbol3, SYMBOL_BID);
+   double ask3 = SymbolInfoDouble(Symbol3, SYMBOL_ASK);
+   
+   if(bid1<=0 || ask1<=0 || bid2<=0 || ask2<=0 || bid3<=0 || ask3<=0) return 0;
+   
+   // Synthetic mid for GBP/JPY = GBP/USD bid * USD/JPY bid (for buying synthetic)
+   double synthetic_bid = bid1 * bid2;
+   double synthetic_ask = ask1 * ask2;
+   
+   // Actual market mid
+   double actual_mid = (bid3 + ask3) / 2.0;
+   
+   // Mispricing as percentage relative to actual
+   double mispricing = (synthetic_bid - actual_mid) / actual_mid;
+   
+   // Convert to points (for JPY pairs, point is 0.001; adjust as needed)
+   double point = SymbolInfoDouble(Symbol3, SYMBOL_POINT) * 10; // For JPY: point = 0.001, we want 0.001 = 1 point
+   if(point <= 0) point = 0.001;
+   
+   return mispricing / point;  // points
+}
+
+//+------------------------------------------------------------------+
+//| Initialize                                                      |
 //+------------------------------------------------------------------+
 int OnInit() {
-   binance_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=" + BinanceSymbol;
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   SymbolSelect(_Symbol, true);
-   
+   ArrayResize(baskets, 0);
+   dayStart = TimeCurrent();
+   dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("🟢 EA - EXACT 3 POINT DIFFERENCE TRADER");
-   Print("   Binance Symbol: ", BinanceSymbol);
-   Print("   MT5 Symbol: ", _Symbol);
-   Print("   Target difference: ", MinDiff_Points, " ± ", DiffExactTolerance, " points");
-   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00 (server time)");
+   Print("🔺 Triangular Arbitrage EA (Risk‑free profit)");
+   Print("   Triangle: ", Symbol1, " / ", Symbol2, " → ", Symbol3);
+   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Helper: Extract double from JSON                                 |
-//+------------------------------------------------------------------+
-double GetJsonDouble(string text, string key) {
-   int pos = StringFind(text, key);
-   if(pos == -1) return -1;
-   int start = pos + StringLen(key);
-   int end = StringFind(text, "\"", start);
-   if(end == -1) end = StringFind(text, ",", start);
-   if(end == -1) end = StringLen(text);
-   string substr = StringSubstr(text, start, end - start);
-   return StringToDouble(substr);
-}
-
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
+//| Tick handler                                                    |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- NEW: TIME FILTER – CLOSE ALL POSITIONS & STOP TRADING OUTSIDE SESSION
+   // --- Session filter ---
    if(!IsTradingTime()) {
-      CloseAllPositions();       // close any leftover positions instantly
-      return;                    // no trading allowed outside hours
+      for(int i=0; i<ArraySize(baskets); i++) if(!baskets[i].closed) CloseBasket(i);
+      return;
    }
    
-   // --- 1. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT) ---
-   for(int i = PositionsTotal()-1; i >= 0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
-         double profit = PositionGetDouble(POSITION_PROFIT);
-         if(profit > 0.0) {
-            if(trade.PositionClose(ticket)) {
-               Print("✅ [CLOSE] Ticket ", ticket, " closed with profit: ", profit);
-            } else {
-               Print("❌ [CLOSE] Failed, error: ", GetLastError());
-            }
-         }
+   // --- Daily loss reset ---
+   datetime now = TimeCurrent();
+   if(now - dayStart >= 86400) {
+      dayStart = now;
+      dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
+      consecutiveLosses = 0;
+      Print("✅ New trading day");
+   }
+   double lossPercent = (dailyEquityStart - AccountInfoDouble(ACCOUNT_EQUITY)) / dailyEquityStart * 100.0;
+   if(lossPercent >= 8.0) {
+      Print("🚨 Daily loss limit reached, stopping.");
+      return;
+   }
+   
+   // --- Close any basket that has positive profit (fast out) ---
+   for(int i=0; i<ArraySize(baskets); i++) {
+      if(baskets[i].closed) continue;
+      
+      // Sum profits of all three positions
+      double totalProfit = 0;
+      if(PositionSelectByTicket(baskets[i].ticket1)) totalProfit += PositionGetDouble(POSITION_PROFIT);
+      if(PositionSelectByTicket(baskets[i].ticket2)) totalProfit += PositionGetDouble(POSITION_PROFIT);
+      if(PositionSelectByTicket(baskets[i].ticket3)) totalProfit += PositionGetDouble(POSITION_PROFIT);
+      
+      if(totalProfit > 0) {
+         CloseBasket(i);
+         Print("✅ Basket closed with total profit: $", totalProfit);
+         consecutiveLosses = 0;
       }
    }
    
-   // --- 2. POSITION LIMIT ---
-   if(PositionsTotal() >= MaxOpenPositions) {
-      static int throttle = 0;
-      if(throttle++ % 100 == 0) Print("⚠️ Max positions reached: ", PositionsTotal());
-      return;
+   // Remove closed baskets from array
+   for(int i=ArraySize(baskets)-1; i>=0; i--) {
+      if(baskets[i].closed) {
+         for(int j=i; j<ArraySize(baskets)-1; j++) baskets[j] = baskets[j+1];
+         ArrayResize(baskets, ArraySize(baskets)-1);
+      }
    }
    
-   // --- 3. GET MT5 PRICES ---
-   double mt5_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double mt5_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(mt5_ask <= 0 || mt5_bid <= 0) {
-      Print("❌ MT5 price error");
-      return;
-   }
-   double mt5_mid = (mt5_ask + mt5_bid) / 2.0;
+   // --- Limit number of active baskets ---
+   if(ArraySize(baskets) >= MaxOpenBaskets) return;
+   if(now - last_trade < 5) return;  // cooldown
    
-   // --- 4. FETCH BINANCE PRICES ---
-   char post[], result[];
-   string headers;
-   int res = WebRequest("GET", binance_url, NULL, NULL, 5000, post, 0, result, headers);
-   if(res <= 0) {
-      Print("❌ WebRequest failed. Error: ", GetLastError());
-      return;
-   }
+   // --- Calculate mispricing ---
+   double mispricingPoints = CalculateMispricingPoints();
+   if(MathAbs(mispricingPoints) < MinProfitPoints) return;
    
-   string resp = CharArrayToString(result);
-   double binance_bid = GetJsonDouble(resp, "\"bidPrice\":\"");
-   double binance_ask = GetJsonDouble(resp, "\"askPrice\":\"");
-   if(binance_bid <= 0 || binance_ask <= 0) {
-      Print("❌ Binance parse error. Response: ", StringSubstr(resp, 0, 200));
-      return;
-   }
-   double binance_mid = (binance_ask + binance_bid) / 2.0;
-   
-   // --- 5. CALCULATE DIFFERENCE (in points) ---
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double diff_points = (binance_mid - mt5_mid) / point;
-   
-   // --- 6. NEW LOGIC: trade only when diff is approximately MinDiff_Points (± tolerance) ---
-   double absDiff = MathAbs(diff_points);
-   bool exactDiff = (absDiff >= MinDiff_Points - DiffExactTolerance && 
-                     absDiff <= MinDiff_Points + DiffExactTolerance);
-   
-   bool buy_signal = (diff_points > 0 && exactDiff);
-   bool sell_signal = (diff_points < 0 && exactDiff);
-   
-   // --- 7. DEBUG OUTPUT (every 5 seconds) ---
-   if(TimeCurrent() - last_debug_time >= 5) {
-      last_debug_time = TimeCurrent();
-      Print("========================================");
-      Print("📊 MT5   Ask: ", DoubleToString(mt5_ask, _Digits), "  Bid: ", DoubleToString(mt5_bid, _Digits));
-      Print("📊 Binance Ask: ", DoubleToString(binance_ask, _Digits), " Bid: ", DoubleToString(binance_bid, _Digits));
-      Print("📊 MT5 Mid: ", DoubleToString(mt5_mid, _Digits));
-      Print("📊 Binance Mid: ", DoubleToString(binance_mid, _Digits));
-      Print("📊 Difference: ", DoubleToString(diff_points, 2), " points");
-      Print("📊 Exact 3pt match: ", exactDiff ? "YES" : "NO");
-      Print("📊 Buy signal: ", buy_signal ? "YES" : "NO", " | Sell signal: ", sell_signal ? "YES" : "NO");
-      Print("========================================");
-   }
-   
-   // --- 8. OPEN TRADE ONLY WHEN EXACT DIFFERENCE IS NEAR 3 POINTS ---
+   // --- Execute triangular arbitrage ---
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    
-   if(buy_signal) {
-      if(trade.Buy(lot, _Symbol, mt5_ask, 0, 0, "Exact3pt Buy")) {
-         Print("🔥 [BUY OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_ask);
+   bool buySynthetic = (mispricingPoints > MinProfitPoints);
+   bool sellSynthetic = (mispricingPoints < -MinProfitPoints);
+   
+   if(!buySynthetic && !sellSynthetic) return;
+   
+   Basket newBasket;
+   newBasket.closed = false;
+   newBasket.profitLock = 0;
+   
+   if(buySynthetic) {
+      // Synthetic is cheaper → buy synthetic (buy leg1 and leg2), sell real (sell leg3)
+      newBasket.ticket1 = trade.Buy(lot, Symbol1, SymbolInfoDouble(Symbol1, SYMBOL_ASK), 0, 0, "Tri Arb Leg1");
+      newBasket.ticket2 = trade.Buy(lot, Symbol2, SymbolInfoDouble(Symbol2, SYMBOL_ASK), 0, 0, "Tri Arb Leg2");
+      newBasket.ticket3 = trade.Sell(lot, Symbol3, SymbolInfoDouble(Symbol3, SYMBOL_BID), 0, 0, "Tri Arb Leg3");
+      if(newBasket.ticket1 && newBasket.ticket2 && newBasket.ticket3) {
+         Print("🔥 Executed BUY synthetic arbitrage. Mispricing: ", mispricingPoints, " pts");
       } else {
-         Print("❌ [BUY FAIL] Error: ", GetLastError());
+         Print("❌ Partial execution, closing.");
+         if(newBasket.ticket1) trade.PositionClose(newBasket.ticket1);
+         if(newBasket.ticket2) trade.PositionClose(newBasket.ticket2);
+         if(newBasket.ticket3) trade.PositionClose(newBasket.ticket3);
+         return;
+      }
+   } else {
+      // Synthetic is overpriced → sell synthetic, buy real
+      newBasket.ticket1 = trade.Sell(lot, Symbol1, SymbolInfoDouble(Symbol1, SYMBOL_BID), 0, 0, "Tri Arb Leg1");
+      newBasket.ticket2 = trade.Sell(lot, Symbol2, SymbolInfoDouble(Symbol2, SYMBOL_BID), 0, 0, "Tri Arb Leg2");
+      newBasket.ticket3 = trade.Buy(lot, Symbol3, SymbolInfoDouble(Symbol3, SYMBOL_ASK), 0, 0, "Tri Arb Leg3");
+      if(newBasket.ticket1 && newBasket.ticket2 && newBasket.ticket3) {
+         Print("🔥 Executed SELL synthetic arbitrage. Mispricing: ", mispricingPoints, " pts");
+      } else {
+         Print("❌ Partial execution, closing.");
+         if(newBasket.ticket1) trade.PositionClose(newBasket.ticket1);
+         if(newBasket.ticket2) trade.PositionClose(newBasket.ticket2);
+         if(newBasket.ticket3) trade.PositionClose(newBasket.ticket3);
+         return;
       }
    }
-   else if(sell_signal) {
-      if(trade.Sell(lot, _Symbol, mt5_bid, 0, 0, "Exact3pt Sell")) {
-         Print("🔥 [SELL OPEN] Diff: ", diff_points, " points | Lot: ", lot, " @ ", mt5_bid);
-      } else {
-         Print("❌ [SELL FAIL] Error: ", GetLastError());
-      }
+   
+   int sz = ArraySize(baskets);
+   ArrayResize(baskets, sz+1);
+   baskets[sz] = newBasket;
+   last_trade = now;
+   
+   // --- Debug output ---
+   if(now - last_debug >= 5) {
+      last_debug = now;
+      Print("📊 Mispricing: ", DoubleToString(mispricingPoints,2), " pts | Active baskets: ", ArraySize(baskets));
    }
 }
 //+------------------------------------------------------------------+
