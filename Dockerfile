@@ -20,29 +20,32 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                    Carry_Trade_EA_Debug.mq5      |
-//|                           Prints swap values, signals, decisions |
+//|                                    Carry_Trade_EA_Fixed.mq5      |
+//|                     Trades even with negative swap (choose best) |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Debug Carry Trade"
-#property version   "1.1"
+#property copyright "Fixed Carry Trade"
+#property version   "2.0"
 #property strict
 
-input string   TradeSymbol      = "AUDJPY";       // Change to your broker's actual symbol (no .vx if not needed)
+// --- INPUTS --------------------------------------------------------+
+input string   TradeSymbol      = "AUDJPY.vx";    // Your symbol
 input double   RiskPercent      = 5.0;
 input int      TakeProfitPips   = 200;
 input int      StopLossPips     = 100;
 input int      MaxOpenPositions = 1;
 input int      MagicNumber      = 999555;
-input bool     UseAutoDirection = true;
-input bool     ManualLong       = false;
+input bool     UseAutoDirection = true;           // true = pick direction with higher swap (even if negative)
+input bool     ManualLong       = false;          // if UseAutoDirection=false, this decides
+input double   MinSwapToTrade   = -999.0;         // Minimum swap allowed (e.g., -10 means swap must be >= -10)
 input int      StartHour        = 0;
 input int      EndHour          = 24;
 input double   MaxDailyLossPercent = 10.0;
 input bool     CloseOnProfit    = true;
 input double   MinProfitUSD     = 5.00;
 
+// --- GLOBALS -------------------------------------------------------+
 CTrade trade;
 datetime lastDebug = 0;
 datetime dayStart = 0;
@@ -50,12 +53,11 @@ double dailyEquityStart = 0;
 bool tradingEnabled = true;
 ulong carryTicket = 0;
 
+//+------------------------------------------------------------------+
 bool IsTradingTime() {
    MqlDateTime dt;
    TimeCurrent(dt);
-   bool inTime = (dt.hour >= StartHour && dt.hour < EndHour);
-   if(!inTime && TimeCurrent()-lastDebug>30) Print("⏰ Outside trading hours. Hour=", dt.hour);
-   return inTime;
+   return (dt.hour >= StartHour && dt.hour < EndHour);
 }
 
 double GetSwapLong() { return SymbolInfoDouble(TradeSymbol, SYMBOL_SWAP_LONG); }
@@ -69,6 +71,7 @@ void CloseCarryTrade() {
    }
 }
 
+//+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
@@ -76,16 +79,17 @@ int OnInit() {
    dayStart = TimeCurrent();
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("💰 CARRY TRADE EA (DEBUG)");
+   Print("💰 CARRY TRADE EA (Fixed)");
    Print("   Symbol: ", TradeSymbol);
    Print("   Long swap: ", GetSwapLong(), " | Short swap: ", GetSwapShort());
-   Print("   Auto direction: ", UseAutoDirection ? "YES" : (ManualLong ? "Long" : "Short"));
+   Print("   Auto direction: ", UseAutoDirection ? "YES (choose higher swap)" : "Manual");
+   Print("   MinSwapToTrade: ", MinSwapToTrade);
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
+//+------------------------------------------------------------------+
 void OnTick() {
-   // Daily loss reset (simplified)
    datetime now = TimeCurrent();
    if(now - dayStart >= 86400) {
       dayStart = now;
@@ -103,7 +107,7 @@ void OnTick() {
    if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
    if(!tradingEnabled) return;
    
-   // Close if profit target reached
+   // Close on profit if enabled
    if(CloseOnProfit && carryTicket != 0 && PositionSelectByTicket(carryTicket)) {
       double profit = PositionGetDouble(POSITION_PROFIT);
       if(profit >= MinProfitUSD) {
@@ -124,21 +128,22 @@ void OnTick() {
       return;
    }
    
-   // Check if we can open new trade
    if(!IsTradingTime()) return;
    if(PositionsTotal() >= MaxOpenPositions) return;
    
-   // Determine direction
+   // --- Determine direction ---
    bool doBuy = false, doSell = false;
    double swapLong = GetSwapLong();
    double swapShort = GetSwapShort();
    
    if(UseAutoDirection) {
-      if(swapLong > 0 && swapLong > swapShort) doBuy = true;
-      else if(swapShort > 0 && swapShort > swapLong) doSell = true;
-      else {
-         Print("⚠️ No positive swap: Long=", swapLong, " Short=", swapShort);
-         return;
+      // Choose direction with higher swap (even if negative)
+      if(swapLong >= swapShort) {
+         if(swapLong >= MinSwapToTrade) doBuy = true;
+         else Print("⚠️ Long swap ", swapLong, " below MinSwapToTrade ", MinSwapToTrade);
+      } else {
+         if(swapShort >= MinSwapToTrade) doSell = true;
+         else Print("⚠️ Short swap ", swapShort, " below MinSwapToTrade ", MinSwapToTrade);
       }
    } else {
       doBuy = ManualLong;
@@ -148,7 +153,8 @@ void OnTick() {
    // Debug every 30 seconds
    if(now - lastDebug >= 30) {
       lastDebug = now;
-      Print("📊 Swap Long=", swapLong, " Short=", swapShort, " doBuy=", doBuy, " doSell=", doSell);
+      Print("📊 Swap Long=", swapLong, " Short=", swapShort);
+      Print("   Selected: ", doBuy ? "BUY" : (doSell ? "SELL" : "NONE"));
       Print("   Bid=", SymbolInfoDouble(TradeSymbol, SYMBOL_BID), " Ask=", SymbolInfoDouble(TradeSymbol, SYMBOL_ASK));
    }
    
@@ -166,14 +172,14 @@ void OnTick() {
       if(TakeProfitPips>0) tp = ask + TakeProfitPips*point;
       if(trade.Buy(lot, TradeSymbol, ask, sl, tp, "Carry Long")) {
          carryTicket = trade.ResultOrder();
-         Print("🔥 Opened LONG carry trade. Swap=", swapLong);
+         Print("🔥 Opened LONG (swap=", swapLong, ")");
       } else Print("❌ Buy failed. Error ", GetLastError());
    } else if(doSell) {
       if(StopLossPips>0) sl = bid + StopLossPips*point;
       if(TakeProfitPips>0) tp = bid - TakeProfitPips*point;
       if(trade.Sell(lot, TradeSymbol, bid, sl, tp, "Carry Short")) {
          carryTicket = trade.ResultOrder();
-         Print("🔥 Opened SHORT carry trade. Swap=", swapShort);
+         Print("🔥 Opened SHORT (swap=", swapShort, ")");
       } else Print("❌ Sell failed. Error ", GetLastError());
    }
 }
