@@ -20,48 +20,41 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                 Triangular_Arbitrage_EA.mq5      |
-//|                     Synthetic triangular arbitrage - risk‑free   |
-//|                             Version 2.0 - Fast profit exit      |
+//|                                   Triangular_Arbitrage_VALETAX.mq5|
+//|                     For .vx symbols, fast profit exit            |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property copyright "Omni-Apex Arbitrage"
-#property version   "2.0"
+#property version   "3.0"
 #property strict
 
-// --- INPUTS --------------------------------------------------------+
-input string   Symbol1         = "GBPUSD";      // Leg 1
-input string   Symbol2         = "USDJPY";      // Leg 2
-input string   Symbol3         = "GBPJPY";      // Synthetic cross
-input double   RiskPercent     = 3.0;           // % equity per basket
-input int      MinProfitPoints = 5;             // Minimum profit in points before closing
-input int      MaxOpenBaskets  = 2;             // Max concurrent triangular positions
+// --- INPUTS (CHANGE THESE TO YOUR BROKER'S SYMBOLS) ---------------+
+input string   Symbol1         = "GBPUSD.vx";     // Leg 1 (e.g., GBPUSD.vx)
+input string   Symbol2         = "USDJPY.vx";     // Leg 2
+input string   Symbol3         = "GBPJPY.vx";     // Synthetic cross
+input double   RiskPercent     = 3.0;             // % equity per basket
+input int      MinProfitPoints = 0;               // Any positive mispricing triggers trade (set to 0 for test)
+input int      MaxOpenBaskets  = 2;               // Max concurrent baskets
 input int      MagicNumber     = 888999;
-input int      StartHour       = 8;             // London session start
-input int      EndHour         = 22;            // Session end
-input double   MinSpreadRatio  = 0.0;           // Minimum mispricing ratio (0 = any mispricing)
+input int      StartHour       = 0;               // 24/7 for testing
+input int      EndHour         = 24;
+input bool     DebugPrint      = true;            // Show prices every 5 sec
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
 datetime last_debug = 0;
 datetime last_trade = 0;
-datetime dayStart = 0;
-double dailyEquityStart = 0;
-int consecutiveLosses = 0;
 
 struct Basket {
-   ulong ticket1;
-   ulong ticket2;
-   ulong ticket3;
-   double profitLock;
-   bool   closed;
+   ulong t1, t2, t3;
+   bool closed;
 };
 Basket baskets[];
 int activeBaskets = 0;
 
 //+------------------------------------------------------------------+
-//| Check trading hours                                             |
+//| Check if we are inside trading hours (simplified)               |
 //+------------------------------------------------------------------+
 bool IsTradingTime() {
    MqlDateTime dt;
@@ -70,30 +63,21 @@ bool IsTradingTime() {
 }
 
 //+------------------------------------------------------------------+
-//| Close all positions for a basket                                 |
+//| Close a basket and mark as closed                               |
 //+------------------------------------------------------------------+
 void CloseBasket(int idx) {
-   if(baskets[idx].ticket1 > 0) trade.PositionClose(baskets[idx].ticket1);
-   if(baskets[idx].ticket2 > 0) trade.PositionClose(baskets[idx].ticket2);
-   if(baskets[idx].ticket3 > 0) trade.PositionClose(baskets[idx].ticket3);
+   if(baskets[idx].t1 > 0) trade.PositionClose(baskets[idx].t1);
+   if(baskets[idx].t2 > 0) trade.PositionClose(baskets[idx].t2);
+   if(baskets[idx].t3 > 0) trade.PositionClose(baskets[idx].t3);
    baskets[idx].closed = true;
+   Print("🕒 Closed basket #", idx);
 }
 
 //+------------------------------------------------------------------+
-//| Find basket index by ticket                                      |
+//| Calculate mispricing in POINTS directly (no percentage)         |
+//| Returns: positive = synthetic cheaper -> buy synthetic; negative = synthetic dearer -> sell synthetic |
 //+------------------------------------------------------------------+
-int FindBasketByTicket(ulong ticket) {
-   for(int i=0; i<ArraySize(baskets); i++) {
-      if(baskets[i].ticket1 == ticket || baskets[i].ticket2 == ticket || baskets[i].ticket3 == ticket)
-         return i;
-   }
-   return -1;
-}
-
-//+------------------------------------------------------------------+
-//| Calculate synthetic rate and mispricing (in points)             |
-//+------------------------------------------------------------------+
-double CalculateMispricingPoints() {
+double CalcMispricingPoints() {
    // Get bid/ask for each leg
    double bid1 = SymbolInfoDouble(Symbol1, SYMBOL_BID);
    double ask1 = SymbolInfoDouble(Symbol1, SYMBOL_ASK);
@@ -102,83 +86,73 @@ double CalculateMispricingPoints() {
    double bid3 = SymbolInfoDouble(Symbol3, SYMBOL_BID);
    double ask3 = SymbolInfoDouble(Symbol3, SYMBOL_ASK);
    
-   if(bid1<=0 || ask1<=0 || bid2<=0 || ask2<=0 || bid3<=0 || ask3<=0) return 0;
+   if(bid1<=0 || ask1<=0 || bid2<=0 || ask2<=0 || bid3<=0 || ask3<=0) {
+      if(DebugPrint && TimeCurrent()-last_debug>=5)
+         Print("❌ Missing price data for one of the symbols");
+      return 0;
+   }
    
-   // Synthetic mid for GBP/JPY = GBP/USD bid * USD/JPY bid (for buying synthetic)
+   // Synthetic bid (buying synthetic means buying leg1 and leg2)
    double synthetic_bid = bid1 * bid2;
-   double synthetic_ask = ask1 * ask2;
-   
    // Actual market mid
    double actual_mid = (bid3 + ask3) / 2.0;
    
-   // Mispricing as percentage relative to actual
-   double mispricing = (synthetic_bid - actual_mid) / actual_mid;
+   // Mispricing in price difference (NOT points yet)
+   double mispricing_price = synthetic_bid - actual_mid;
    
-   // Convert to points (for JPY pairs, point is 0.001; adjust as needed)
-   double point = SymbolInfoDouble(Symbol3, SYMBOL_POINT) * 10; // For JPY: point = 0.001, we want 0.001 = 1 point
-   if(point <= 0) point = 0.001;
+   // Get point size for the cross (Symbol3). For JPY pairs, point = 0.001; for non-JPY, point = 0.00001 typically
+   double point3 = SymbolInfoDouble(Symbol3, SYMBOL_POINT);
+   if(point3 <= 0) {
+      // Fallback: detect JPY pair
+      if(StringFind(Symbol3, "JPY") >= 0) point3 = 0.001;
+      else point3 = 0.00001;
+   }
    
-   return mispricing / point;  // points
+   double mispricing_points = mispricing_price / point3;
+   return mispricing_points;
 }
 
 //+------------------------------------------------------------------+
-//| Initialize                                                      |
+//| OnInit                                                          |
 //+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   ArrayResize(baskets, 0);
-   dayStart = TimeCurrent();
-   dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
+   // Ensure symbols are visible in Market Watch
+   SymbolSelect(Symbol1, true);
+   SymbolSelect(Symbol2, true);
+   SymbolSelect(Symbol3, true);
    Print("==============================================");
-   Print("🔺 Triangular Arbitrage EA (Risk‑free profit)");
-   Print("   Triangle: ", Symbol1, " / ", Symbol2, " → ", Symbol3);
+   Print("🔺 TRIANGULAR ARBITRAGE EA (for .vx symbols)");
+   Print("   Triangle: ", Symbol1, " + ", Symbol2, " → ", Symbol3);
+   Print("   MinProfitPoints = ", MinProfitPoints);
    Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Tick handler                                                    |
+//| OnTick                                                          |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // --- Session filter ---
+   // Session filter
    if(!IsTradingTime()) {
       for(int i=0; i<ArraySize(baskets); i++) if(!baskets[i].closed) CloseBasket(i);
       return;
    }
    
-   // --- Daily loss reset ---
-   datetime now = TimeCurrent();
-   if(now - dayStart >= 86400) {
-      dayStart = now;
-      dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
-      consecutiveLosses = 0;
-      Print("✅ New trading day");
-   }
-   double lossPercent = (dailyEquityStart - AccountInfoDouble(ACCOUNT_EQUITY)) / dailyEquityStart * 100.0;
-   if(lossPercent >= 8.0) {
-      Print("🚨 Daily loss limit reached, stopping.");
-      return;
-   }
-   
-   // --- Close any basket that has positive profit (fast out) ---
+   // --- Close any basket with positive total profit (fast out) ---
    for(int i=0; i<ArraySize(baskets); i++) {
       if(baskets[i].closed) continue;
-      
-      // Sum profits of all three positions
-      double totalProfit = 0;
-      if(PositionSelectByTicket(baskets[i].ticket1)) totalProfit += PositionGetDouble(POSITION_PROFIT);
-      if(PositionSelectByTicket(baskets[i].ticket2)) totalProfit += PositionGetDouble(POSITION_PROFIT);
-      if(PositionSelectByTicket(baskets[i].ticket3)) totalProfit += PositionGetDouble(POSITION_PROFIT);
-      
-      if(totalProfit > 0) {
+      double profit = 0;
+      if(PositionSelectByTicket(baskets[i].t1)) profit += PositionGetDouble(POSITION_PROFIT);
+      if(PositionSelectByTicket(baskets[i].t2)) profit += PositionGetDouble(POSITION_PROFIT);
+      if(PositionSelectByTicket(baskets[i].t3)) profit += PositionGetDouble(POSITION_PROFIT);
+      if(profit > 0) {
          CloseBasket(i);
-         Print("✅ Basket closed with total profit: $", totalProfit);
-         consecutiveLosses = 0;
+         Print("✅ Basket closed with profit: $", profit);
       }
    }
-   
    // Remove closed baskets from array
    for(int i=ArraySize(baskets)-1; i>=0; i--) {
       if(baskets[i].closed) {
@@ -187,66 +161,77 @@ void OnTick() {
       }
    }
    
-   // --- Limit number of active baskets ---
+   // --- Position limit and cooldown ---
    if(ArraySize(baskets) >= MaxOpenBaskets) return;
-   if(now - last_trade < 5) return;  // cooldown
+   if(TimeCurrent() - last_trade < 5) return;
    
-   // --- Calculate mispricing ---
-   double mispricingPoints = CalculateMispricingPoints();
-   if(MathAbs(mispricingPoints) < MinProfitPoints) return;
+   // --- Calculate mispricing in points ---
+   double mispricing = CalcMispricingPoints();
    
-   // --- Execute triangular arbitrage ---
-   double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
-   lot = MathMax(0.01, lot);
+   // --- Debug print every 5 seconds ---
+   if(DebugPrint && TimeCurrent() - last_debug >= 5) {
+      last_debug = TimeCurrent();
+      double bid1 = SymbolInfoDouble(Symbol1, SYMBOL_BID);
+      double bid2 = SymbolInfoDouble(Symbol2, SYMBOL_BID);
+      double bid3 = SymbolInfoDouble(Symbol3, SYMBOL_BID);
+      double ask3 = SymbolInfoDouble(Symbol3, SYMBOL_ASK);
+      double synthetic = bid1 * bid2;
+      double actual_mid = (bid3 + ask3)/2.0;
+      Print("========================================");
+      Print("📊 ", Symbol1, " bid: ", bid1, " | ", Symbol2, " bid: ", bid2);
+      Print("📊 ", Symbol3, " bid: ", bid3, " ask: ", ask3);
+      Print("📊 Synthetic bid: ", synthetic, " | Actual mid: ", actual_mid);
+      Print("📉 Mispricing: ", DoubleToString(mispricing,2), " points");
+      Print("🔍 Active baskets: ", ArraySize(baskets));
+      Print("========================================");
+   }
    
-   bool buySynthetic = (mispricingPoints > MinProfitPoints);
-   bool sellSynthetic = (mispricingPoints < -MinProfitPoints);
+   // Check if mispricing exceeds threshold
+   if(MathAbs(mispricing) < MinProfitPoints) return;
    
+   // Determine direction
+   bool buySynthetic = (mispricing > MinProfitPoints);
+   bool sellSynthetic = (mispricing < -MinProfitPoints);
    if(!buySynthetic && !sellSynthetic) return;
+   
+   // --- Calculate lot size ---
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
+   lot = MathMax(0.01, lot);
+   // Ensure lot is within broker limits
+   double maxLot = SymbolInfoDouble(Symbol1, SYMBOL_VOLUME_MAX);
+   lot = MathMin(lot, maxLot);
    
    Basket newBasket;
    newBasket.closed = false;
-   newBasket.profitLock = 0;
+   newBasket.t1 = 0; newBasket.t2 = 0; newBasket.t3 = 0;
    
    if(buySynthetic) {
-      // Synthetic is cheaper → buy synthetic (buy leg1 and leg2), sell real (sell leg3)
-      newBasket.ticket1 = trade.Buy(lot, Symbol1, SymbolInfoDouble(Symbol1, SYMBOL_ASK), 0, 0, "Tri Arb Leg1");
-      newBasket.ticket2 = trade.Buy(lot, Symbol2, SymbolInfoDouble(Symbol2, SYMBOL_ASK), 0, 0, "Tri Arb Leg2");
-      newBasket.ticket3 = trade.Sell(lot, Symbol3, SymbolInfoDouble(Symbol3, SYMBOL_BID), 0, 0, "Tri Arb Leg3");
-      if(newBasket.ticket1 && newBasket.ticket2 && newBasket.ticket3) {
-         Print("🔥 Executed BUY synthetic arbitrage. Mispricing: ", mispricingPoints, " pts");
-      } else {
-         Print("❌ Partial execution, closing.");
-         if(newBasket.ticket1) trade.PositionClose(newBasket.ticket1);
-         if(newBasket.ticket2) trade.PositionClose(newBasket.ticket2);
-         if(newBasket.ticket3) trade.PositionClose(newBasket.ticket3);
-         return;
-      }
+      // Synthetic cheaper → buy leg1 & leg2, sell leg3
+      newBasket.t1 = trade.Buy(lot, Symbol1, SymbolInfoDouble(Symbol1, SYMBOL_ASK), 0, 0, "TriLeg1");
+      newBasket.t2 = trade.Buy(lot, Symbol2, SymbolInfoDouble(Symbol2, SYMBOL_ASK), 0, 0, "TriLeg2");
+      newBasket.t3 = trade.Sell(lot, Symbol3, SymbolInfoDouble(Symbol3, SYMBOL_BID), 0, 0, "TriLeg3");
    } else {
-      // Synthetic is overpriced → sell synthetic, buy real
-      newBasket.ticket1 = trade.Sell(lot, Symbol1, SymbolInfoDouble(Symbol1, SYMBOL_BID), 0, 0, "Tri Arb Leg1");
-      newBasket.ticket2 = trade.Sell(lot, Symbol2, SymbolInfoDouble(Symbol2, SYMBOL_BID), 0, 0, "Tri Arb Leg2");
-      newBasket.ticket3 = trade.Buy(lot, Symbol3, SymbolInfoDouble(Symbol3, SYMBOL_ASK), 0, 0, "Tri Arb Leg3");
-      if(newBasket.ticket1 && newBasket.ticket2 && newBasket.ticket3) {
-         Print("🔥 Executed SELL synthetic arbitrage. Mispricing: ", mispricingPoints, " pts");
-      } else {
-         Print("❌ Partial execution, closing.");
-         if(newBasket.ticket1) trade.PositionClose(newBasket.ticket1);
-         if(newBasket.ticket2) trade.PositionClose(newBasket.ticket2);
-         if(newBasket.ticket3) trade.PositionClose(newBasket.ticket3);
-         return;
-      }
+      // Synthetic overpriced → sell leg1 & leg2, buy leg3
+      newBasket.t1 = trade.Sell(lot, Symbol1, SymbolInfoDouble(Symbol1, SYMBOL_BID), 0, 0, "TriLeg1");
+      newBasket.t2 = trade.Sell(lot, Symbol2, SymbolInfoDouble(Symbol2, SYMBOL_BID), 0, 0, "TriLeg2");
+      newBasket.t3 = trade.Buy(lot, Symbol3, SymbolInfoDouble(Symbol3, SYMBOL_ASK), 0, 0, "TriLeg3");
    }
    
-   int sz = ArraySize(baskets);
-   ArrayResize(baskets, sz+1);
-   baskets[sz] = newBasket;
-   last_trade = now;
-   
-   // --- Debug output ---
-   if(now - last_debug >= 5) {
-      last_debug = now;
-      Print("📊 Mispricing: ", DoubleToString(mispricingPoints,2), " pts | Active baskets: ", ArraySize(baskets));
+   // Verify all three trades succeeded
+   if(newBasket.t1 && newBasket.t2 && newBasket.t3) {
+      int sz = ArraySize(baskets);
+      ArrayResize(baskets, sz+1);
+      baskets[sz] = newBasket;
+      last_trade = TimeCurrent();
+      Print("🔥 Basket opened! Mispricing: ", DoubleToString(mispricing,2), " points");
+      Print("   Trades: ", (buySynthetic?"Buy Synthetic":"Sell Synthetic"));
+   } else {
+      // Partial fill – close any opened legs
+      if(newBasket.t1) trade.PositionClose(newBasket.t1);
+      if(newBasket.t2) trade.PositionClose(newBasket.t2);
+      if(newBasket.t3) trade.PositionClose(newBasket.t3);
+      Print("❌ Failed to execute full basket, retrying later.");
    }
 }
 //+------------------------------------------------------------------+
