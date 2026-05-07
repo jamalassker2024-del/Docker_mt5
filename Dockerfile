@@ -22,11 +22,12 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                      الروبوت الرابح - Exact 3pt |
 //|                     Only trades when difference ≈ 3 points      |
+//|                     + Time filter: London session (8-22)        |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property copyright "Omni-Apex V22.0 - Modified"
-#property version   "22.01"
+#property version   "22.02"
 #property strict
 
 // --- INPUTS
@@ -37,10 +38,35 @@ input double DiffExactTolerance = 0.5;         // Acceptable deviation (± point
 input int    MaxOpenPositions  = 5;
 input int    MagicNumber       = 999022;
 
+// --- NEW TIME FILTER INPUTS
+input int    StartHour         = 8;            // London session start (server time, 24h format)
+input int    EndHour           = 22;           // Session end – at this hour all trades closed, no new trades
+
 // --- GLOBALS
 CTrade trade;
 string binance_url;
 datetime last_debug_time = 0;
+
+//+------------------------------------------------------------------+
+//| Helper: Check if we are inside trading hours                    |
+//+------------------------------------------------------------------+
+bool IsTradingTime() {
+   int hour = TimeHour(TimeCurrent());  // broker/server time
+   return (hour >= StartHour && hour < EndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Close all open positions                                         |
+//+------------------------------------------------------------------+
+void CloseAllPositions() {
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+         trade.PositionClose(ticket);
+         Print("🕒 [SESSION END] Closed position ", ticket);
+      }
+   }
+}
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
@@ -56,6 +82,7 @@ int OnInit() {
    Print("   Binance Symbol: ", BinanceSymbol);
    Print("   MT5 Symbol: ", _Symbol);
    Print("   Target difference: ", MinDiff_Points, " ± ", DiffExactTolerance, " points");
+   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00 (server time)");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
@@ -78,6 +105,12 @@ double GetJsonDouble(string text, string key) {
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
+   // --- NEW: TIME FILTER – CLOSE ALL POSITIONS & STOP TRADING OUTSIDE SESSION
+   if(!IsTradingTime()) {
+      CloseAllPositions();       // close any leftover positions instantly
+      return;                    // no trading allowed outside hours
+   }
+   
    // --- 1. CLOSE ANY POSITION WITH POSITIVE PROFIT (FAST OUT) ---
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       ulong ticket = PositionGetTicket(i);
