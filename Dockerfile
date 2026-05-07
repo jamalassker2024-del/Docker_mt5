@@ -27,7 +27,7 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 #include <Trade\Trade.mqh>
 
 #property copyright "Omni-Apex V22.0 - Modified"
-#property version   "22.02"
+#property version   "22.03"
 #property strict
 
 // --- INPUTS
@@ -48,10 +48,12 @@ string binance_url;
 datetime last_debug_time = 0;
 
 //+------------------------------------------------------------------+
-//| Helper: Check if we are inside trading hours                    |
+//| Helper: Check if we are inside trading hours (fixed)            |
 //+------------------------------------------------------------------+
 bool IsTradingTime() {
-   int hour = TimeHour(TimeCurrent());  // broker/server time
+   MqlDateTime dt;
+   TimeCurrent(dt);            // fills dt structure safely
+   int hour = dt.hour;         // broker/server time
    return (hour >= StartHour && hour < EndHour);
 }
 
