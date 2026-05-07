@@ -20,41 +20,41 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                   Triangular_Arbitrage_VALETAX.mq5|
-//|                     For .vx symbols, fast profit exit            |
+//|                                    Carry_Trade_EA.mq5            |
+//|                     Earn daily swap by trading high interest leg |
+//|                             Version 1.0 - Valetax compatible    |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "Omni-Apex Arbitrage"
-#property version   "3.0"
+#property copyright "Omni-Apex Carry Trade"
+#property version   "1.0"
 #property strict
 
-// --- INPUTS (CHANGE THESE TO YOUR BROKER'S SYMBOLS) ---------------+
-input string   Symbol1         = "GBPUSD.vx";     // Leg 1 (e.g., GBPUSD.vx)
-input string   Symbol2         = "USDJPY.vx";     // Leg 2
-input string   Symbol3         = "GBPJPY.vx";     // Synthetic cross
-input double   RiskPercent     = 3.0;             // % equity per basket
-input int      MinProfitPoints = 0;               // Any positive mispricing triggers trade (set to 0 for test)
-input int      MaxOpenBaskets  = 2;               // Max concurrent baskets
-input int      MagicNumber     = 888999;
-input int      StartHour       = 0;               // 24/7 for testing
-input int      EndHour         = 24;
-input bool     DebugPrint      = true;            // Show prices every 5 sec
+// --- INPUTS --------------------------------------------------------+
+input string   TradeSymbol      = "AUDJPY.vx";    // Symbol to trade (use your broker's suffix)
+input double   RiskPercent      = 5.0;            // % of equity for position sizing
+input int      TakeProfitPips   = 200;            // Take profit in pips (0 = disabled)
+input int      StopLossPips     = 100;            // Stop loss in pips (0 = disabled)
+input int      MaxOpenPositions = 1;              // Max concurrent carry trades
+input int      MagicNumber      = 999555;
+input bool     UseAutoDirection = true;           // true = auto pick positive swap side, false = manual direction below
+input bool     ManualLong       = false;          // if UseAutoDirection=false, true = open long, false = open short
+input int      StartHour        = 0;              // Trading hours start (0-24, 0 = all day)
+input int      EndHour          = 24;             // Trading hours end
+input double   MaxDailyLossPercent = 10.0;        // Stop trading after this % loss in a day
+input bool     CloseOnProfit    = true;           // If total profit > MinProfitUSD, close trade
+input double   MinProfitUSD     = 5.00;           // Minimum profit to close (if CloseOnProfit=true)
 
 // --- GLOBALS -------------------------------------------------------+
 CTrade trade;
-datetime last_debug = 0;
-datetime last_trade = 0;
-
-struct Basket {
-   ulong t1, t2, t3;
-   bool closed;
-};
-Basket baskets[];
-int activeBaskets = 0;
+datetime lastDebug = 0;
+datetime dayStart = 0;
+double dailyEquityStart = 0;
+bool tradingEnabled = true;
+ulong carryTicket = 0;          // ticket of the open carry trade
 
 //+------------------------------------------------------------------+
-//| Check if we are inside trading hours (simplified)               |
+//| Check if we are inside trading hours                            |
 //+------------------------------------------------------------------+
 bool IsTradingTime() {
    MqlDateTime dt;
@@ -63,175 +63,176 @@ bool IsTradingTime() {
 }
 
 //+------------------------------------------------------------------+
-//| Close a basket and mark as closed                               |
+//| Get swap rate for long or short (in account currency per lot)   |
 //+------------------------------------------------------------------+
-void CloseBasket(int idx) {
-   if(baskets[idx].t1 > 0) trade.PositionClose(baskets[idx].t1);
-   if(baskets[idx].t2 > 0) trade.PositionClose(baskets[idx].t2);
-   if(baskets[idx].t3 > 0) trade.PositionClose(baskets[idx].t3);
-   baskets[idx].closed = true;
-   Print("🕒 Closed basket #", idx);
+double GetSwapLong() {
+   return SymbolInfoDouble(TradeSymbol, SYMBOL_SWAP_LONG);
+}
+double GetSwapShort() {
+   return SymbolInfoDouble(TradeSymbol, SYMBOL_SWAP_SHORT);
 }
 
 //+------------------------------------------------------------------+
-//| Calculate mispricing in POINTS directly (no percentage)         |
-//| Returns: positive = synthetic cheaper -> buy synthetic; negative = synthetic dearer -> sell synthetic |
+//| Close existing carry trade                                      |
 //+------------------------------------------------------------------+
-double CalcMispricingPoints() {
-   // Get bid/ask for each leg
-   double bid1 = SymbolInfoDouble(Symbol1, SYMBOL_BID);
-   double ask1 = SymbolInfoDouble(Symbol1, SYMBOL_ASK);
-   double bid2 = SymbolInfoDouble(Symbol2, SYMBOL_BID);
-   double ask2 = SymbolInfoDouble(Symbol2, SYMBOL_ASK);
-   double bid3 = SymbolInfoDouble(Symbol3, SYMBOL_BID);
-   double ask3 = SymbolInfoDouble(Symbol3, SYMBOL_ASK);
-   
-   if(bid1<=0 || ask1<=0 || bid2<=0 || ask2<=0 || bid3<=0 || ask3<=0) {
-      if(DebugPrint && TimeCurrent()-last_debug>=5)
-         Print("❌ Missing price data for one of the symbols");
-      return 0;
+void CloseCarryTrade() {
+   if(carryTicket != 0 && PositionSelectByTicket(carryTicket)) {
+      trade.PositionClose(carryTicket);
+      Print("Closed carry trade. Ticket: ", carryTicket);
+      carryTicket = 0;
    }
-   
-   // Synthetic bid (buying synthetic means buying leg1 and leg2)
-   double synthetic_bid = bid1 * bid2;
-   // Actual market mid
-   double actual_mid = (bid3 + ask3) / 2.0;
-   
-   // Mispricing in price difference (NOT points yet)
-   double mispricing_price = synthetic_bid - actual_mid;
-   
-   // Get point size for the cross (Symbol3). For JPY pairs, point = 0.001; for non-JPY, point = 0.00001 typically
-   double point3 = SymbolInfoDouble(Symbol3, SYMBOL_POINT);
-   if(point3 <= 0) {
-      // Fallback: detect JPY pair
-      if(StringFind(Symbol3, "JPY") >= 0) point3 = 0.001;
-      else point3 = 0.00001;
-   }
-   
-   double mispricing_points = mispricing_price / point3;
-   return mispricing_points;
 }
 
 //+------------------------------------------------------------------+
-//| OnInit                                                          |
+//| Expert initialization                                           |
 //+------------------------------------------------------------------+
 int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   // Ensure symbols are visible in Market Watch
-   SymbolSelect(Symbol1, true);
-   SymbolSelect(Symbol2, true);
-   SymbolSelect(Symbol3, true);
+   SymbolSelect(TradeSymbol, true);
+   dayStart = TimeCurrent();
+   dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("🔺 TRIANGULAR ARBITRAGE EA (for .vx symbols)");
-   Print("   Triangle: ", Symbol1, " + ", Symbol2, " → ", Symbol3);
-   Print("   MinProfitPoints = ", MinProfitPoints);
-   Print("   Trading hours: ", StartHour, ":00 - ", EndHour, ":00");
+   Print("💰 CARRY TRADE EA");
+   Print("   Symbol: ", TradeSymbol);
+   Print("   Long swap: ", GetSwapLong(), " | Short swap: ", GetSwapShort());
+   Print("   Auto direction: ", UseAutoDirection ? "YES" : (ManualLong ? "Long" : "Short"));
+   if(TakeProfitPips > 0) Print("   Take profit: ", TakeProfitPips, " pips");
+   if(StopLossPips > 0) Print("   Stop loss: ", StopLossPips, " pips");
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| OnTick                                                          |
+//| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick() {
-   // Session filter
-   if(!IsTradingTime()) {
-      for(int i=0; i<ArraySize(baskets); i++) if(!baskets[i].closed) CloseBasket(i);
+   // --- Daily loss reset ---
+   datetime now = TimeCurrent();
+   if(now - dayStart >= 86400) {
+      dayStart = now;
+      dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
+      tradingEnabled = true;
+      Print("✅ New trading day, loss counter reset.");
+   }
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lossPercent = (dailyEquityStart - equity) / dailyEquityStart * 100.0;
+   if(lossPercent >= MaxDailyLossPercent) {
+      if(tradingEnabled) {
+         Print("🚨 Daily loss limit reached (", lossPercent, "%). Trading disabled.");
+         tradingEnabled = false;
+      }
       return;
    }
+   if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
+   if(!tradingEnabled) return;
    
-   // --- Close any basket with positive total profit (fast out) ---
-   for(int i=0; i<ArraySize(baskets); i++) {
-      if(baskets[i].closed) continue;
-      double profit = 0;
-      if(PositionSelectByTicket(baskets[i].t1)) profit += PositionGetDouble(POSITION_PROFIT);
-      if(PositionSelectByTicket(baskets[i].t2)) profit += PositionGetDouble(POSITION_PROFIT);
-      if(PositionSelectByTicket(baskets[i].t3)) profit += PositionGetDouble(POSITION_PROFIT);
-      if(profit > 0) {
-         CloseBasket(i);
-         Print("✅ Basket closed with profit: $", profit);
-      }
-   }
-   // Remove closed baskets from array
-   for(int i=ArraySize(baskets)-1; i>=0; i--) {
-      if(baskets[i].closed) {
-         for(int j=i; j<ArraySize(baskets)-1; j++) baskets[j] = baskets[j+1];
-         ArrayResize(baskets, ArraySize(baskets)-1);
+   // --- Close if profit target reached ---
+   if(CloseOnProfit && carryTicket != 0 && PositionSelectByTicket(carryTicket)) {
+      double profit = PositionGetDouble(POSITION_PROFIT);
+      if(profit >= MinProfitUSD) {
+         CloseCarryTrade();
+         Print("✅ Closed carry trade due to profit target: $", profit);
       }
    }
    
-   // --- Position limit and cooldown ---
-   if(ArraySize(baskets) >= MaxOpenBaskets) return;
-   if(TimeCurrent() - last_trade < 5) return;
-   
-   // --- Calculate mispricing in points ---
-   double mispricing = CalcMispricingPoints();
-   
-   // --- Debug print every 5 seconds ---
-   if(DebugPrint && TimeCurrent() - last_debug >= 5) {
-      last_debug = TimeCurrent();
-      double bid1 = SymbolInfoDouble(Symbol1, SYMBOL_BID);
-      double bid2 = SymbolInfoDouble(Symbol2, SYMBOL_BID);
-      double bid3 = SymbolInfoDouble(Symbol3, SYMBOL_BID);
-      double ask3 = SymbolInfoDouble(Symbol3, SYMBOL_ASK);
-      double synthetic = bid1 * bid2;
-      double actual_mid = (bid3 + ask3)/2.0;
-      Print("========================================");
-      Print("📊 ", Symbol1, " bid: ", bid1, " | ", Symbol2, " bid: ", bid2);
-      Print("📊 ", Symbol3, " bid: ", bid3, " ask: ", ask3);
-      Print("📊 Synthetic bid: ", synthetic, " | Actual mid: ", actual_mid);
-      Print("📉 Mispricing: ", DoubleToString(mispricing,2), " points");
-      Print("🔍 Active baskets: ", ArraySize(baskets));
-      Print("========================================");
+   // --- Manage open position (update SL/TP if not set) ---
+   if(carryTicket != 0 && PositionSelectByTicket(carryTicket)) {
+      double sl = 0, tp = 0;
+      if(StopLossPips > 0) {
+         double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         if(type == POSITION_TYPE_BUY)
+            sl = openPrice - StopLossPips * point;
+         else
+            sl = openPrice + StopLossPips * point;
+      }
+      if(TakeProfitPips > 0) {
+         double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         if(type == POSITION_TYPE_BUY)
+            tp = openPrice + TakeProfitPips * point;
+         else
+            tp = openPrice - TakeProfitPips * point;
+      }
+      // Only modify if different
+      if((sl > 0 || tp > 0) && (MathAbs(PositionGetDouble(POSITION_SL)-sl) > point || MathAbs(PositionGetDouble(POSITION_TP)-tp) > point))
+         trade.PositionModify(carryTicket, sl, tp);
+      return;  // already have a position
    }
    
-   // Check if mispricing exceeds threshold
-   if(MathAbs(mispricing) < MinProfitPoints) return;
+   // --- Check if we can open a new carry trade (outside trading hours or max positions?) ---
+   if(!IsTradingTime()) return;
+   if(PositionsTotal() >= MaxOpenPositions) return;
    
-   // Determine direction
-   bool buySynthetic = (mispricing > MinProfitPoints);
-   bool sellSynthetic = (mispricing < -MinProfitPoints);
-   if(!buySynthetic && !sellSynthetic) return;
+   // --- Determine direction based on swap rates ---
+   bool doBuy = false, doSell = false;
+   if(UseAutoDirection) {
+      double swapLong = GetSwapLong();
+      double swapShort = GetSwapShort();
+      if(swapLong > 0 && swapLong > swapShort) doBuy = true;
+      else if(swapShort > 0 && swapShort > swapLong) doSell = true;
+      else {
+         if(swapLong <= 0 && swapShort <= 0) {
+            if(DebugPrint())
+               Print("⚠️ No positive swap available for ", TradeSymbol);
+            return;
+         }
+         // If both positive? Normally only one is positive. But if both, pick higher.
+         if(swapLong > 0 && swapShort > 0) {
+            doBuy = (swapLong >= swapShort);
+            doSell = !doBuy;
+         }
+         else if(swapLong > 0) doBuy = true;
+         else if(swapShort > 0) doSell = true;
+      }
+   } else {
+      doBuy = ManualLong;
+      doSell = !ManualLong;
+   }
    
-   // --- Calculate lot size ---
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double lot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
+   if(!doBuy && !doSell) return;
+   
+   // --- Calculate lot size based on risk % of equity ---
+   double equitySize = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lot = NormalizeDouble(equitySize / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
-   // Ensure lot is within broker limits
-   double maxLot = SymbolInfoDouble(Symbol1, SYMBOL_VOLUME_MAX);
-   lot = MathMin(lot, maxLot);
+   lot = MathMin(lot, SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MAX));
    
-   Basket newBasket;
-   newBasket.closed = false;
-   newBasket.t1 = 0; newBasket.t2 = 0; newBasket.t3 = 0;
+   // --- Open position with optional SL/TP ---
+   double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
+   double sl = 0, tp = 0;
+   double point = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
    
-   if(buySynthetic) {
-      // Synthetic cheaper → buy leg1 & leg2, sell leg3
-      newBasket.t1 = trade.Buy(lot, Symbol1, SymbolInfoDouble(Symbol1, SYMBOL_ASK), 0, 0, "TriLeg1");
-      newBasket.t2 = trade.Buy(lot, Symbol2, SymbolInfoDouble(Symbol2, SYMBOL_ASK), 0, 0, "TriLeg2");
-      newBasket.t3 = trade.Sell(lot, Symbol3, SymbolInfoDouble(Symbol3, SYMBOL_BID), 0, 0, "TriLeg3");
-   } else {
-      // Synthetic overpriced → sell leg1 & leg2, buy leg3
-      newBasket.t1 = trade.Sell(lot, Symbol1, SymbolInfoDouble(Symbol1, SYMBOL_BID), 0, 0, "TriLeg1");
-      newBasket.t2 = trade.Sell(lot, Symbol2, SymbolInfoDouble(Symbol2, SYMBOL_BID), 0, 0, "TriLeg2");
-      newBasket.t3 = trade.Buy(lot, Symbol3, SymbolInfoDouble(Symbol3, SYMBOL_ASK), 0, 0, "TriLeg3");
+   if(doBuy) {
+      if(StopLossPips > 0) sl = ask - StopLossPips * point;
+      if(TakeProfitPips > 0) tp = ask + TakeProfitPips * point;
+      if(trade.Buy(lot, TradeSymbol, ask, sl, tp, "Carry Long")) {
+         carryTicket = trade.ResultOrder();
+         Print("🔥 Opened LONG carry trade. Swap long: ", GetSwapLong(), " | Lot: ", lot);
+      } else {
+         Print("❌ Failed to open long. Error: ", GetLastError());
+      }
+   }
+   else if(doSell) {
+      if(StopLossPips > 0) sl = bid + StopLossPips * point;
+      if(TakeProfitPips > 0) tp = bid - TakeProfitPips * point;
+      if(trade.Sell(lot, TradeSymbol, bid, sl, tp, "Carry Short")) {
+         carryTicket = trade.ResultOrder();
+         Print("🔥 Opened SHORT carry trade. Swap short: ", GetSwapShort(), " | Lot: ", lot);
+      } else {
+         Print("❌ Failed to open short. Error: ", GetLastError());
+      }
    }
    
-   // Verify all three trades succeeded
-   if(newBasket.t1 && newBasket.t2 && newBasket.t3) {
-      int sz = ArraySize(baskets);
-      ArrayResize(baskets, sz+1);
-      baskets[sz] = newBasket;
-      last_trade = TimeCurrent();
-      Print("🔥 Basket opened! Mispricing: ", DoubleToString(mispricing,2), " points");
-      Print("   Trades: ", (buySynthetic?"Buy Synthetic":"Sell Synthetic"));
-   } else {
-      // Partial fill – close any opened legs
-      if(newBasket.t1) trade.PositionClose(newBasket.t1);
-      if(newBasket.t2) trade.PositionClose(newBasket.t2);
-      if(newBasket.t3) trade.PositionClose(newBasket.t3);
-      Print("❌ Failed to execute full basket, retrying later.");
+   // --- Debug every 60 seconds ---
+   if(TimeCurrent() - lastDebug >= 60) {
+      lastDebug = TimeCurrent();
+      Print("📊 Carry status: Open trade = ", (carryTicket != 0 ? "YES" : "NO"));
+      Print("   Long swap: ", GetSwapLong(), " | Short swap: ", GetSwapShort());
    }
 }
 //+------------------------------------------------------------------+
