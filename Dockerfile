@@ -21,24 +21,23 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                    Pairs_Trading_ProfitExit.mq5 |
-//|                     Close on any profit OR at specific goal     |
-//|                     Version 6.0 – full working code             |
+//|                     Debug: prints total profit every 5 sec      |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property copyright "Strict Pairs Trading"
-#property version   "6.0"
+#property version   "6.1"
 #property strict
 
 // --- INPUTS --------------------------------------------------------+
 input string   AssetA           = "EURUSD.vx";
 input string   AssetB           = "GBPUSD.vx";
-input double   RiskPercent      = 2.0;              // % equity per trade (total both legs)
-input int      LookbackPeriod   = 50;               // Period for spread mean/std dev
-input double   EntryZScore      = 2.0;              // Entry threshold (absolute)
-input int      MaxHoldMinutes   = 60;               // Max holding time – force close
-input bool     CloseOnAnyProfit = true;             // true = close when total profit > 0; false = use MinProfitUSD
-input double   MinProfitUSD     = 5.00;             // Profit goal (used only if CloseOnAnyProfit = false)
+input double   RiskPercent      = 2.0;
+input int      LookbackPeriod   = 50;
+input double   EntryZScore      = 2.0;
+input int      MaxHoldMinutes   = 60;
+input bool     CloseOnAnyProfit = true;
+input double   MinProfitUSD     = 5.00;
 input int      MagicNumber      = 777888;
 input int      StartHour        = 0;
 input int      EndHour          = 24;
@@ -64,16 +63,12 @@ struct ActivePair {
 ActivePair currentPair;
 
 //+------------------------------------------------------------------+
-//| Check trading hours                                             |
-//+------------------------------------------------------------------+
 bool IsTradingTime() {
    MqlDateTime dt;
    TimeCurrent(dt);
    return (dt.hour >= StartHour && dt.hour < EndHour);
 }
 
-//+------------------------------------------------------------------+
-//| Calculate Z-score of spread (bidA - bidB)                       |
 //+------------------------------------------------------------------+
 double GetZScore() {
    double bidA = SymbolInfoDouble(AssetA, SYMBOL_BID);
@@ -101,8 +96,6 @@ double GetZScore() {
 }
 
 //+------------------------------------------------------------------+
-//| Close the current pair trade                                    |
-//+------------------------------------------------------------------+
 void ClosePairTrade(string reason) {
    if(!currentPair.isOpen) return;
    if(currentPair.ticketA != 0 && PositionSelectByTicket(currentPair.ticketA))
@@ -114,8 +107,6 @@ void ClosePairTrade(string reason) {
 }
 
 //+------------------------------------------------------------------+
-//| Initialize                                                      |
-//+------------------------------------------------------------------+
 int OnInit() {
    tradeA.SetExpertMagicNumber(MagicNumber);
    tradeB.SetExpertMagicNumber(MagicNumber+1);
@@ -125,27 +116,21 @@ int OnInit() {
    dayStart = TimeCurrent();
    dailyEquityStart = AccountInfoDouble(ACCOUNT_EQUITY);
    Print("==============================================");
-   Print("📊 PAIRS TRADING (Profit Exit)");
+   Print("📊 PAIRS TRADING (DEBUG - Profit Exit)");
    Print("   ", AssetA, " <-> ", AssetB);
    Print("   Entry Z‑Score: ±", EntryZScore);
-   Print("   Max hold time: ", MaxHoldMinutes, " min");
-   Print("   Close on any profit: ", CloseOnAnyProfit);
-   if(!CloseOnAnyProfit) Print("   Profit goal: $", MinProfitUSD);
+   Print("   CloseOnAnyProfit: ", CloseOnAnyProfit);
    Print("==============================================");
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Tick handler                                                    |
-//+------------------------------------------------------------------+
 void OnTick() {
-   // Session filter
    if(!IsTradingTime()) {
       if(currentPair.isOpen) ClosePairTrade("Session ended");
       return;
    }
    
-   // Daily loss & reset
    datetime now = TimeCurrent();
    if(now - dayStart >= 86400) {
       dayStart = now;
@@ -164,47 +149,52 @@ void OnTick() {
    if(!tradingEnabled && lossPercent < MaxDailyLossPercent-2) tradingEnabled = true;
    if(!tradingEnabled) return;
    
-   // --- Manage active pair trade (if any) ---
+   // --- Manage active pair ---
    if(currentPair.isOpen) {
-      // Calculate total profit of the pair
-      double profit = 0;
+      // Calculate total profit
+      double profitA = 0, profitB = 0;
       if(currentPair.ticketA != 0 && PositionSelectByTicket(currentPair.ticketA))
-         profit += PositionGetDouble(POSITION_PROFIT);
+         profitA = PositionGetDouble(POSITION_PROFIT);
       if(currentPair.ticketB != 0 && PositionSelectByTicket(currentPair.ticketB))
-         profit += PositionGetDouble(POSITION_PROFIT);
+         profitB = PositionGetDouble(POSITION_PROFIT);
+      double totalProfit = profitA + profitB;
       
-      // Fast exit on any positive profit
-      if(CloseOnAnyProfit && profit > 0) {
-         ClosePairTrade("Profit > 0 ($" + DoubleToString(profit,2) + ")");
+      // DEBUG: print profit every 5 seconds
+      if(DebugPrint && now - lastDebug >= 5) {
+         lastDebug = now;
+         Print("📊 Ticket A:", currentPair.ticketA, " profitA=", profitA, 
+               " | Ticket B:", currentPair.ticketB, " profitB=", profitB,
+               " | Total=", totalProfit);
+      }
+      
+      // Close condition
+      if(CloseOnAnyProfit && totalProfit > 0) {
+         ClosePairTrade("Profit > 0 ($" + DoubleToString(totalProfit,2) + ")");
          consecutiveLosses = 0;
          return;
       }
-      // Exit when profit reaches the specified goal (only if not closing on any profit)
-      if(!CloseOnAnyProfit && profit >= MinProfitUSD) {
-         ClosePairTrade("Profit goal $" + DoubleToString(MinProfitUSD) + " reached");
+      if(!CloseOnAnyProfit && totalProfit >= MinProfitUSD) {
+         ClosePairTrade("Profit goal $" + DoubleToString(MinProfitUSD));
          consecutiveLosses = 0;
          return;
       }
-      // Force close after max holding time
       if(MaxHoldMinutes > 0 && (now - currentPair.openTime) >= MaxHoldMinutes * 60) {
-         ClosePairTrade("Max holding time (" + IntegerToString(MaxHoldMinutes) + " min)");
+         ClosePairTrade("Max holding time");
          return;
       }
-      return; // still holding
-   }
-   
-   // --- No active pair: check if we can open a new one ---
-   if(consecutiveLosses >= 3) {
-      static int warn=0; if(warn++%50==0) Print("⛔ Paused due to consecutive losses");
       return;
    }
-   if(now - lastTrade < 10) return; // cooldown
    
-   // Calculate Z‑Score for entry
+   // --- No active pair: open new trade ---
+   if(consecutiveLosses >= 3) {
+      static int warn=0; if(warn++%50==0) Print("⛔ Paused due to losses");
+      return;
+   }
+   if(now - lastTrade < 10) return;
+   
    double zScore = GetZScore();
    if(zScore == 0 || ArraySize(spreadBuffer) < LookbackPeriod) return;
    
-   // Debug every 5 seconds
    if(DebugPrint && now - lastDebug >= 5) {
       lastDebug = now;
       double bidA = SymbolInfoDouble(AssetA, SYMBOL_BID);
@@ -212,11 +202,10 @@ void OnTick() {
       Print("📊 Spread: ", DoubleToString(bidA-bidB,5), " Z‑Score: ", DoubleToString(zScore,2));
    }
    
-   bool openShortA_LongB = (zScore > EntryZScore);   // short A, long B
-   bool openLongA_ShortB = (zScore < -EntryZScore);  // long A, short B
+   bool openShortA_LongB = (zScore > EntryZScore);
+   bool openLongA_ShortB = (zScore < -EntryZScore);
    if(!openShortA_LongB && !openLongA_ShortB) return;
    
-   // Equal lot sizing for both legs
    double lot = NormalizeDouble(equity / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
    lot = MathMin(lot, SymbolInfoDouble(AssetA, SYMBOL_VOLUME_MAX));
